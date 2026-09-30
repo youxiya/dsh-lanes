@@ -76,9 +76,13 @@ def check(lane: str, root: Path) -> bool:
     rc = run(["open", lane, "--detach", "--no-browser"])
     if rc != 0:
         return False
+    # 运行态：v0.3 起按 profile 命名（<lane>__web.json）；旧的 <lane>.json 也认
+    run_path = root / "run" / f"{lane}__web.json"
+    if not run_path.exists():
+        run_path = root / "run" / f"{lane}.json"
     try:
-        data = json.loads((root / "run" / f"{lane}.json").read_text(encoding="utf-8"))
-    except Exception as exc:  # noqa: BLE001
+        data = json.loads(run_path.read_text(encoding="utf-8"))
+    except Exception as exc:
         print(f"读运行态失败：{exc}", flush=True)
         return False
     url = data.get("url", "")

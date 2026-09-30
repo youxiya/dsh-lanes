@@ -10,8 +10,9 @@ DSH 多版本启动器（第一步：创建 / 打开指定版本）
 --------
 1. `versions` —— 查询 npm registry 上 @deepseek-ai/dsh 的全部版本与 dist-tag（纯脚本 HTTP）
 2. `create`   —— 把指定版本装进独立目录（互不覆盖）并登记成一条 lane
-3. `open`     —— 用该 lane 自己的 DSH_HOME / 端口启动 dsh web，并打开带 token 的正确 URL
-4. `list` / `stop` / `logs` / `doctor` —— 查看、停止、排障
+3. `open`     —— 用该 lane 自己的 DSH_HOME / 端口启动一个 profile，并打开带 token 的正确 URL
+4. `profiles` —— 一条 lane（一个 DSH_HOME）里管理多个 profile：各自一套插件组合，即多环境
+5. `list` / `stop` / `logs` / `doctor` —— 查看、停止、排障
 
 为什么每个 lane 要独立 DSH_HOME
 --------------------------------
@@ -19,25 +20,32 @@ DSH 启动时会把 `$DSH_HOME/profiles/node_modules` 的模块回退链接重�
 依赖闭包（dsh-app-boot 的 healProfilesModuleFallback）。两套版本共用同一个 home，会随着谁启动
 就把这份共享镜像往谁那边治一次。所以 lane 之间必须隔离安装目录 + 隔离 home。
 
+lane 内部的多环境靠 **profile**：`dsh <profile>` 启动 `$DSH_HOME/profiles/<profile>`，
+每个 profile 有自己的插件组合（bundles / node_modules / cordis.patch.yml），
+但同一 HOME 里的会话、凭据、设置是共享的——于是**一个版本就能开多个环境**，
+不必为每个环境复制一整套 dsh。端 口不固定：每次启动实时挑空闲端口（也可以现场指定）。
+
 目录布局（默认 root = D:\\dsh-lanes，可在 lanes.json 改）
 --------------------------------------------------------
     <root>/
-      versions/<版本>/        npm --prefix 目标：node_modules/@deepseek-ai/dsh/lib/bin.js
-      homes/<lane>/           DSH_HOME：settings/sessions/credentials/profiles
-      run/<lane>.json         运行态：pid / port / url
-      logs/<lane>.log         启动与安装日志
+      versions/<版本>/              npm --prefix 目标：node_modules/@deepseek-ai/dsh/lib/bin.js
+      homes/<lane>/                 DSH_HOME：settings/sessions/credentials/profiles
+      homes/<lane>/profiles/<名>/   一个 profile＝一个环境（插件组合独立，会话/凭据共享）
+      run/<lane>__<profile>.json    运行态：pid / port / url（旧版 <lane>.json 读作 profile web）
+      logs/<lane>__<profile>.log    启动与安装日志
 
 用法
 ----
     py dsh_lanes.py doctor
     py dsh_lanes.py versions
     py dsh_lanes.py create next 0.1.7-rc.2
-    py dsh_lanes.py open next
-    py dsh_lanes.py open 0.1.7-rc.2 --port 3082
+    py dsh_lanes.py open next                     # 启动默认 profile（web），端口自动挑
+    py dsh_lanes.py open next/test --port 3082    # 启动指定 profile、现场指定端口
+    py dsh_lanes.py profile-add next clean --from web   # 复制 web 的插件组合成新环境
     py dsh_lanes.py list
-    py dsh_lanes.py logs next
-    py dsh_lanes.py stop next
-    py dsh_lanes.py primary global      # 标记常用版本：新建 lane 会继承它的 API key
+    py dsh_lanes.py logs next/test
+    py dsh_lanes.py stop next                     # 停掉这条 lane 的全部 profile
+    py dsh_lanes.py copy-key global next --only DEEPSEEK_API_KEY   # 按条目复制 API key
     py dsh_lanes.py delete next --stop  # 删除一套 DSH（登记 + 安装树 + HOME）
 """
 
@@ -154,9 +162,6 @@ DEFAULT_CONFIG = {
     "default_cwd": "",
     "startup_timeout": 240,
     "open_browser": True,
-    # 「主要版本」：你日常用的那条 lane。新建 lane 时会自动把它的 API key 复制过去，
-    # 删除它需要二次确认（GUI 里要手打 lane 名）。
-    "primary": "",
     "allow_scripts": DEFAULT_ALLOW_SCRIPTS,
     "lanes": {},
 }
@@ -580,14 +585,36 @@ def find_installs(cfg: dict | None = None) -> list[dict]:
                 pass
 
     if cfg:
+        p = paths(cfg)
+        registered_trees: set[str] = set()
         for lane, data in cfg.get("lanes", {}).items():
-            if isinstance(data, dict) and data.get("version"):
-                # 注意：lane 目录自己的 package.json 是 npm --prefix 的前缀清单
-                # （name = dsh-lane-<版本>），真正的 dsh 清单在嵌套的 node_modules 里。
-                add(
-                    paths(cfg)["versions"] / str(data["version"]) / "node_modules" / "@deepseek-ai" / "dsh",
-                    f"lane {lane}",
-                )
+            if not (isinstance(data, dict) and data.get("version")):
+                continue
+            # 注意：lane 目录自己的 package.json 是 npm --prefix 的前缀清单
+            # （name = dsh-lane-<版本>），真正的 dsh 清单在嵌套的 node_modules 里。
+            if data.get("installDir"):
+                registered_trees.add(str(Path(data["installDir"]).resolve()).lower())
+                continue
+            tree = p["versions"] / str(data["version"])
+            registered_trees.add(str(tree.resolve()).lower())
+            add(tree / "node_modules" / "@deepseek-ai" / "dsh", f"lane {lane}")
+        # versions/ 与 clones/ 里**没被任何 lane 登记**的树也列出来：
+        # 手动拷进来的、登记表丢过的，都能在这里看到并手动认领
+        for sub, label in ((p["versions"], "versions 目录（未登记）"),
+                           (p["clones"], "clones 目录（未登记）")):
+            if not sub.is_dir():
+                continue
+            try:
+                entries = sorted(sub.iterdir())
+            except OSError:
+                continue
+            for entry in entries:
+                if not entry.is_dir() or str(entry.resolve()).lower() in registered_trees:
+                    continue
+                before = len(results)
+                add(entry / "node_modules" / "@deepseek-ai" / "dsh", label)
+                if len(results) > before:
+                    results[-1]["tree"] = str(entry)
 
     return results
 
@@ -608,10 +635,10 @@ def discover_instances(cfg: dict) -> list[dict]:
     listeners = tcp_listeners()
     lo, hi = cfg.get("port_range", [3080, 3129])
     owned: dict[int, str] = {}
-    for lane in cfg.get("lanes", {}):
-        rt = read_run(cfg, lane)
-        if rt and int(rt.get("port") or 0):
-            owned[int(rt["port"])] = lane
+    for rec in all_run_records(cfg):
+        port = int(rec.get("port") or 0)
+        if port and rec.get("lane"):
+            owned[port] = f"{rec['lane']}/{rec.get('profile') or DEFAULT_PROFILE}"
 
     found: list[dict] = []
     for port in sorted(listeners):
@@ -646,14 +673,365 @@ def discover_instances(cfg: dict) -> list[dict]:
     return found
 
 
-def read_run(cfg: dict, lane: str) -> dict | None:
-    f = paths(cfg)["run"] / f"{lane}.json"
+# ======================= 自动认领：磁盘上没登记的 lane =======================
+#
+# lanes.json 只记"登记表"，而创建 / 复制出来的东西都在磁盘上（homes、versions、clones、
+# 启动日志）。登记表丢过（换目录跑、手删、exe 与源码各存一份）之后，磁盘上的东西就成了
+# "孤儿"——界面上看不见，也没法从这里打开。这一段负责把它们**自动认回来**：
+#
+#   ① 副本对：`clones/<名>` 安装树 + `homes/<名>` HOME 成对出现（clone 的固定布局）→ 直接认；
+#   ② 日志配对：`homes/<名>` 未登记 → 从启动器自己的启动日志头（`===== … $ node …bin.js
+#      web --port N`）里找回它用过的安装树和端口 → 认回来，并把端口记成 web profile 的偏好
+#      （这样手动启动的实例也能被自愈逻辑按端口认回）；
+#   ③ 孤儿安装树（没有任何 HOME 配对，比如只有 versions/<版本>）→ 不自动认（不知道 HOME 是谁），
+#      列在「本机各套安装」里等手动认领。
+#
+# 认领只做一件事：往 lanes.json 里补登记。不动任何目录，名字撞了就跳过（登记表优先）。
+
+LANE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
+
+
+def _lane_clues_from_log(path: Path) -> dict | None:
+    """从一条启动日志里取回最近一次启动的线索：入口脚本 / 端口 / profile。
+
+    日志头是启动器自己写的：`===== 时间 $ node …bin.js [web|--profile P] --port N … (cwd=…)`。
+    从**最新的一条**往回找（日志是追加的，旧的端口早就不是现在的了）。
+    """
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in reversed(text.splitlines()):
+        if "$ " not in line or "bin.js" not in line:
+            continue
+        header = line.split("$ ", 1)[1].split("(cwd=", 1)[0].strip()
+        tokens = header.split()
+        try:
+            idx = next(i for i, t in enumerate(tokens) if t.endswith("bin.js"))
+        except StopIteration:
+            continue
+        rest = tokens[idx + 1:]
+        port = None
+        for j, tok in enumerate(rest):
+            if tok == "--port" and j + 1 < len(rest) and rest[j + 1].isdigit():
+                port = int(rest[j + 1])
+                break
+        return {"entry": tokens[idx], "port": port}
+    return None
+
+
+def _install_tree_of_entry(entry_text: str) -> Path | None:
+    """从入口脚本路径反推安装树：兼容 prefix 树与接管型包目录两种写法。"""
+    p = Path(entry_text)
+    parts = p.parts
+    tail = ("node_modules", "@deepseek-ai", "dsh", "lib", "bin.js")
+    if len(parts) >= len(tail) and tuple(parts[-len(tail):]) == tail:
+        return Path(*parts[: len(parts) - len(tail)])
+    pkg = p.parent.parent  # 接管型：<包目录>\lib\bin.js
+    if pkg.name == "dsh" and pkg.parent.name == "@deepseek-ai":
+        return pkg
+    return None
+
+
+def find_lost_lanes(cfg: dict) -> list[dict]:
+    """找出磁盘上有、登记表里没有的 lane 痕迹（不改任何东西，只报告）。"""
+    p = ensure_layout(cfg)
+    registered = {n for n, d in cfg.get("lanes", {}).items() if isinstance(d, dict)}
+    out: list[dict] = []
+    seen_names: set[str] = set()
+
+    # ① 副本对（clone 的固定布局，不需要日志就能认）
+    if p["clones"].is_dir():
+        try:
+            entries = sorted(p["clones"].iterdir())
+        except OSError:
+            entries = []
+        for entry in entries:
+            name = entry.name
+            if not entry.is_dir() or name in registered or not LANE_NAME_RE.match(name):
+                continue
+            home = p["homes"] / name
+            if not home.is_dir():
+                continue
+            version = _manifest_version(entry / "node_modules" / "@deepseek-ai" / "dsh")
+            clue = _lane_clues_from_log(p["logs"] / f"{name}.log")
+            clue = clue or _lane_clues_from_log(p["logs"] / f"{name}__{DEFAULT_PROFILE}.log")
+            seen_names.add(name)
+            out.append({
+                "name": name, "home": home, "install": entry, "version": version,
+                "port": (clue or {}).get("port"), "kind": "clone", "confident": True,
+                "why": f"clones\\{name} 安装树 + homes\\{name} HOME 成对（clone 布局）",
+            })
+
+    # ② HOME 在、登记表没有 → 从启动日志里找回安装树与端口
+    if p["homes"].is_dir():
+        try:
+            entries = sorted(p["homes"].iterdir())
+        except OSError:
+            entries = []
+        for entry in entries:
+            name = entry.name
+            if (not entry.is_dir() or name in registered or name in seen_names
+                    or not LANE_NAME_RE.match(name)):
+                continue
+            install = None
+            version = None
+            port = None
+            logs = sorted(p["logs"].glob(f"{name}*.log")) if p["logs"].is_dir() else []
+            for log in reversed(logs):  # 新日志优先
+                clue = _lane_clues_from_log(log)
+                if not clue:
+                    continue
+                tree = _install_tree_of_entry(clue["entry"])
+                if tree is None:
+                    continue
+                # 两种安装树写法都要认：接管型（树根本身就是 dsh 包目录）与
+                # prefix 型（树根是 npm --prefix 前缀，真正的 dsh 清单在嵌套的 node_modules 里）
+                if _manifest_name(tree) == PKG:
+                    install, version = tree, _manifest_version(tree)
+                elif _manifest_name(tree / "node_modules" / "@deepseek-ai" / "dsh") == PKG:
+                    install = tree
+                    version = _manifest_version(tree / "node_modules" / "@deepseek-ai" / "dsh")
+                if install is not None:
+                    port = clue.get("port")
+                    break
+            confident = install is not None
+            seen_names.add(name)
+            out.append({
+                "name": name, "home": entry, "install": install, "version": version,
+                "port": port, "kind": "created", "confident": confident,
+                "why": (f"homes\\{name} 在磁盘上，启动日志里找回了它的安装树"
+                        if confident else
+                        f"homes\\{name} 在磁盘上，但日志里没找到配对的安装树（不自动认领）"),
+            })
+    return out
+
+
+def adopt_lost_lanes(cfg: dict) -> list[dict]:
+    """把**配对明确**的未登记 lane 自动补进登记表。返回这次认领了哪些。
+
+    什么时候会用到：lanes.json 被删过 / 换了目录跑（exe 与源码各存一份配置）/ 手动清理过，
+    而创建、复制出来的 homes / versions / clones 都还在磁盘上。认领是纯登记：
+    不动任何目录，端口线索记成 web profile 的偏好，好让手动启动的实例也能被认回。
+    """
+    adopted: list[dict] = []
+    for item in find_lost_lanes(cfg):
+        if not item.get("confident") or not item.get("name") or item["name"] in cfg.get("lanes", {}):
+            continue
+        data: dict = {
+            "version": item.get("version") or "?",
+            "home": str(item["home"]),
+            "createdAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "note": "由启动器自动重新认领（磁盘上发现未登记的 lane）",
+        }
+        if item.get("kind") == "clone":
+            data["installDir"] = str(item["install"])
+            data["kind"] = "clone"
+        elif item.get("install") is not None:
+            standard = paths(cfg)["versions"] / str(item.get("version"))
+            try:
+                nonstandard = item["install"].resolve() != standard.resolve()
+            except OSError:
+                nonstandard = True
+            if nonstandard:
+                data["installDir"] = str(item["install"])
+        if item.get("port"):
+            data["port"] = int(item["port"])
+        cfg["lanes"][item["name"]] = data
+        adopted.append(item)
+    if adopted:
+        save_config(cfg)
+    return adopted
+
+
+# ======================= profile：一条 lane 里的多个环境 =======================
+#
+# lane ＝ 一个版本（一棵安装树 + 一个 DSH_HOME）；profile ＝ 这个 HOME 里的一个环境：
+# `$DSH_HOME/profiles/<名>/`（各自的插件组合 / 补丁层 / node_modules）。
+# 会话、凭据、设置在 HOME 级共享——所以一个版本就能开出多个环境，不必复制多套 dsh。
+#
+# profile 的**真值在磁盘**（HOME/profiles/ 下有哪些目录）；lanes.json 里 lane 的
+# "profiles" 字段只存提示（可选的端口偏好、登记时间）。旧配置没有 profiles 字段时，
+# 一律按 {"web": {端口提示＝旧 lane 端口}} 看，行为与 v0.2 兼容。
+#
+# 保留名与规则照抄 dsh-app-boot（loadProfile / resolveProfileDir / PROFILE_TEMPLATES）：
+# · `desktop` 由 DSH Desktop（Electron）独占，命令行起不了；
+# · 官方模板 web / acp / headless / sdk / sdk-minimal 首次启动会自动初始化；
+# · 自定义 profile 需要目录里先有 package.json——profile-add 就是替你把这个建好。
+
+DEFAULT_PROFILE = "web"
+RESERVED_PROFILES = {"desktop"}
+PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+# 与 dsh-app-boot 的 PROFILE_TEMPLATES 一致（2026-09-30 对照 0.1.7-rc.2 安装树核对）。
+SHIPPED_TEMPLATES: dict[str, list[str]] = {
+    "web": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"],
+    "acp": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-acp-app"],
+    "headless": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-headless"],
+    "sdk": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-sdk-app"],
+    "sdk-minimal": ["@deepseek-ai/dsh-sdk-minimal"],
+}
+
+PROFILE_PATCH_TEMPLATE = (
+    "# Your patch layer for this dsh profile, applied after every bundle layer:\n"
+    "# a top-level YAML array of loader patch entries (id-targeted config\n"
+    "# overrides, disables, and insert lists; `!!js` expressions allowed).\n"
+    "[]\n"
+)
+PROFILE_PNPM_WORKSPACE = "packages:\n  - .\n\nnodeLinker: hoisted\nautoInstallPeers: false\n"
+
+
+def init_profile_dir(dir: Path, bundles: list[str]) -> None:
+    """按 dsh-app-boot `initProfile` 的形状初始化 profile 目录（存在的一律不覆盖）。
+
+    官方组合包不用预装：宿主启动时会从当次安装树解析（resolveBundleDir）；
+    这里只补 profile 自己的三件套——清单（含 bundles）、空补丁层、pnpm 工作区设置。
+    """
+    dir = Path(dir)
+    dir.mkdir(parents=True, exist_ok=True)
+    manifest = dir / "package.json"
+    if not manifest.is_file():
+        manifest.write_text(
+            json.dumps(
+                {
+                    "name": f"dsh-profile-{dir.name}",
+                    "private": True,
+                    "dependencies": {},
+                    "dsh": {"profile": {"bundles": list(bundles)}},
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    patch = dir / "cordis.patch.yml"
+    if not patch.is_file():
+        patch.write_text(PROFILE_PATCH_TEMPLATE, encoding="utf-8")
+    workspace = dir / "pnpm-workspace.yaml"
+    if not workspace.is_file():
+        workspace.write_text(PROFILE_PNPM_WORKSPACE, encoding="utf-8")
+
+
+def validate_profile_name(name: str) -> None:
+    """profile 名能不能用。规则与宿主 resolveProfileDir 对齐，再加保留名。"""
+    if not name or not PROFILE_NAME_RE.match(name) or name in (".", "..", "node_modules"):
+        raise ValueError(f"profile 名不合法：{name!r}（字母/数字开头，只含字母 数字 . _ -）")
+    if name in RESERVED_PROFILES:
+        raise ValueError(f"profile「{name}」由 DSH Desktop（Electron 应用）独占，命令行不能启动它")
+
+
+def disk_profiles(home) -> list[str]:
+    """HOME/profiles/ 下真实存在的 profile（有 package.json 的目录；排除保留名）。"""
+    root = Path(home) / "profiles"
+    out: list[str] = []
+    if not root.is_dir():
+        return out
+    try:
+        entries = sorted(root.iterdir())
+    except OSError:
+        return out
+    for entry in entries:
+        if not entry.is_dir() or entry.name in RESERVED_PROFILES or entry.name == "node_modules":
+            continue
+        if (entry / "package.json").is_file():
+            out.append(entry.name)
+    return out
+
+
+def lane_profile_hints(cfg: dict, lane: str) -> dict[str, dict]:
+    """lanes.json 里登记的 profile 提示；旧配置（无 profiles 字段）迁移成 web 视图。"""
+    data = cfg.get("lanes", {}).get(lane) or {}
+    profiles = data.get("profiles")
+    if isinstance(profiles, dict) and profiles:
+        return {str(k): (v if isinstance(v, dict) else {}) for k, v in profiles.items()}
+    # 旧数据：lane 级的 port 就是 web profile 的端口偏好（接管 lane 靠它认回 3080）
+    out: dict[str, dict] = {DEFAULT_PROFILE: {}}
+    if data.get("port"):
+        out[DEFAULT_PROFILE]["port"] = int(data["port"])
+    return out
+
+
+def lane_profiles_view(cfg: dict, lane: str) -> dict[str, dict]:
+    """这条 lane 可用的全部 profile ＝ 配置登记 ∪ 磁盘真实存在的。
+
+    返回 {名字: {"port": 端口偏好或 None, "createdAt": …, "onDisk": 是否在磁盘上,
+    "registered": 是否登记进 lanes.json}}。磁盘是真值：手动建过的 profile 也会出现，
+    直接 open 就能用。
+    """
+    data = cfg.get("lanes", {}).get(lane) or {}
+    home = Path(data.get("home") or (paths(cfg)["homes"] / lane))
+    view: dict[str, dict] = {}
+    for name, hint in lane_profile_hints(cfg, lane).items():
+        view[name] = {
+            "port": hint.get("port"),
+            "createdAt": hint.get("createdAt"),
+            "onDisk": False,
+            "registered": True,
+        }
+    for name in disk_profiles(home):
+        if name in view:
+            view[name]["onDisk"] = True
+        else:
+            view[name] = {"port": None, "createdAt": None, "onDisk": True, "registered": False}
+    return view
+
+
+def default_profile_of(view: dict[str, dict]) -> str:
+    """这条 lane 的默认 profile：web 优先，否则按名字排序取第一个。"""
+    if DEFAULT_PROFILE in view:
+        return DEFAULT_PROFILE
+    return sorted(view)[0] if view else DEFAULT_PROFILE
+
+
+def profile_hint_port(cfg: dict, lane: str, profile: str) -> int | None:
+    """这个 profile 的端口偏好（仅提示；启动时被占用会自动改口）。"""
+    return lane_profiles_view(cfg, lane).get(profile, {}).get("port")
+
+
+def set_profile_hint(cfg: dict, lane: str, profile: str, remove: bool = False, **fields) -> None:
+    """把 profile 提示写回 lanes.json（第一次写时顺手把旧 lane 端口迁到 web 名下）。"""
+    data = cfg["lanes"][lane]
+    profiles = data.get("profiles")
+    if not isinstance(profiles, dict):
+        profiles = {}
+        if data.get("port"):
+            profiles[DEFAULT_PROFILE] = {"port": int(data["port"])}
+    if remove:
+        profiles.pop(profile, None)
+    else:
+        entry = dict(profiles.get(profile) or {})
+        entry.update(fields)
+        profiles[profile] = entry
+    data["profiles"] = profiles
+    save_config(cfg)
+
+
+def run_file(cfg: dict, lane: str, profile: str) -> Path:
+    """运行态文件：<root>/run/<lane>__<profile>.json。"""
+    return paths(cfg)["run"] / f"{lane}__{profile}.json"
+
+
+def legacy_run_file(cfg: dict, lane: str) -> Path:
+    """v0.2 及以前的运行态文件（无 profile 概念），读取时视作 profile web。"""
+    return paths(cfg)["run"] / f"{lane}.json"
+
+
+def read_run(cfg: dict, lane: str, profile: str = DEFAULT_PROFILE) -> dict | None:
+    """读运行态。旧的 `run/<lane>.json`（v0.2 及以前，无 profile 概念）读作 profile web。"""
+    f = run_file(cfg, lane, profile)
+    if not f.exists() and profile == DEFAULT_PROFILE:
+        f = legacy_run_file(cfg, lane)
     if not f.exists():
         return None
     try:
-        return json.loads(f.read_text(encoding="utf-8"))
+        data = json.loads(f.read_text(encoding="utf-8"))
     except Exception:
         return None
+    if isinstance(data, dict):
+        data.setdefault("profile", profile)
+        return data
+    return None
 
 
 _WRITE_WARNED: set[str] = set()
@@ -676,7 +1054,7 @@ def lane_root_writable(cfg: dict) -> tuple[bool, str]:
         return False, f"{root}（{exc}）"
 
 
-def write_run(cfg: dict, lane: str, data: dict) -> bool:
+def write_run(cfg: dict, lane: str, profile: str, data: dict) -> bool:
     """写运行态文件。**绝不抛异常**：写不进去只警告一次，功能降级。
 
     为什么这么写：这个文件只是"记住上一次是谁起的"，不是必要数据；而它在 GUI 每次刷新的
@@ -686,12 +1064,15 @@ def write_run(cfg: dict, lane: str, data: dict) -> bool:
     """
     try:
         p = ensure_layout(cfg)
-        (p["run"] / f"{lane}.json").write_text(
-            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        payload = dict(data)
+        payload["lane"] = lane
+        payload["profile"] = profile
+        (p["run"] / f"{lane}__{profile}.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         return True
     except OSError as exc:
-        key = f"{lane}|{exc}"
+        key = f"{lane}/{profile}|{exc}"
         if key not in _WRITE_WARNED:
             _WRITE_WARNED.add(key)
             warn(f"运行态写不进去（{paths(cfg)['run']}）：{exc}")
@@ -699,38 +1080,108 @@ def write_run(cfg: dict, lane: str, data: dict) -> bool:
         return False
 
 
-def clear_run(cfg: dict, lane: str) -> None:
-    f = paths(cfg)["run"] / f"{lane}.json"
+def clear_run(cfg: dict, lane: str, profile: str | None = None) -> None:
+    """清运行态。profile=None ＝ 这条 lane 的全部 profile（含 v0.2 的无名旧文件）。"""
+    if profile:
+        candidates: list[Path] = [run_file(cfg, lane, profile)]
+        if profile == DEFAULT_PROFILE:
+            candidates.append(legacy_run_file(cfg, lane))
+    else:
+        candidates = sorted(paths(cfg)["run"].glob(f"{lane}__*.json"))
+        candidates.append(legacy_run_file(cfg, lane))
+    for f in candidates:
+        try:
+            f.unlink()
+        except OSError:
+            pass
+
+
+def all_run_records(cfg: dict) -> list[dict]:
+    """扫一遍 run 目录，返回所有运行态记录（lane / profile / port / pid …）。
+
+    run 目录里就几十个小文件，全扫只要几毫秒；多 profile 之后端口不再固定，
+    "哪些端口是我们自己的实例"只能靠这里的记录回答，不能从 lane 配置反推。
+    """
+    out: list[dict] = []
+    run_dir = paths(cfg)["run"]
     try:
-        f.unlink()
+        files = sorted(run_dir.glob("*.json"))
     except OSError:
-        pass
+        return out
+    for f in files:
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        rec = dict(data)
+        stem = f.stem
+        if not rec.get("lane"):
+            rec["lane"] = stem.split("__", 1)[0]
+        if not rec.get("profile"):
+            # 旧命名 <lane>.json（无 __）读作 web；新命名按文件名补齐
+            rec["profile"] = stem.rsplit("__", 1)[1] if "__" in stem else DEFAULT_PROFILE
+        out.append(rec)
+    return out
 
 
-def lane_runtime(cfg: dict, lane: str) -> dict | None:
+def port_claimed_by_other(cfg: dict, lane: str, profile: str, port: int) -> bool:
+    """这个端口有没有被**别的** (lane, profile) 的存活实例认领着。
+
+    用途：打开时发现"偏好的端口上已经有个 DSH"，要先确认它不是兄弟 profile
+    或别的 lane 的实例，才允许走"接管"——否则会把他人的实例记到自己名下。
+    """
+    for rec in all_run_records(cfg):
+        if int(rec.get("port") or 0) != int(port):
+            continue
+        if rec.get("lane") == lane and rec.get("profile") == profile:
+            continue
+        if pid_alive(int(rec.get("pid") or 0)):
+            return True
+    return False
+
+
+def lane_any_running(cfg: dict, lane: str) -> dict | None:
+    """这条 lane 有**任何一个** profile 在跑吗？返回第一个找到的运行态记录。
+
+    升级 / 删除 / 复制这类"动整条 lane"的操作要用它——它们关心的不是某个
+    profile，而是"这个 HOME / 这棵安装树现在有没有进程在用"。
+    """
+    view = lane_profiles_view(cfg, lane)
+    order = [DEFAULT_PROFILE] + sorted(name for name in view if name != DEFAULT_PROFILE)
+    order = [name for name in order if name in view]
+    for prof in order:
+        rt = lane_runtime(cfg, lane, prof)
+        if rt:
+            return rt
+    return None
+
+
+def lane_runtime(cfg: dict, lane: str, profile: str = DEFAULT_PROFILE) -> dict | None:
     """返回仍在运行的运行态记录；进程已死则顺手清理。
 
     被"接管"的实例（不是本启动器启动的）要额外核对进程启动时间：
     PID 会被系统回收，只靠 pid_alive 会把一个不相干的新进程误判成"还在跑"。
     """
-    data = read_run(cfg, lane)
+    data = read_run(cfg, lane, profile)
     if not data:
         return None
     pid = int(data.get("pid", 0))
     if not pid_alive(pid):
-        clear_run(cfg, lane)
+        clear_run(cfg, lane, profile)
         return None
     expect = data.get("procStartedAt")
     if data.get("adopted") and expect:
         actual = process_start_time(pid)
         if actual and actual != expect:
-            clear_run(cfg, lane)
+            clear_run(cfg, lane, profile)
             return None
     return data
 
 
-def reconcile_lane(cfg: dict, lane: str) -> dict | None:
-    """刷新时的自愈：没有存活运行态、但这条 lane 的端口上是个 DSH 实例 → 自动重新接管。
+def reconcile_lane(cfg: dict, lane: str, profile: str = DEFAULT_PROFILE) -> dict | None:
+    """刷新时的自愈：没有存活运行态、但这个 profile 的端口上是个 DSH 实例 → 自动重新接管。
 
     为什么要这一步：你用别的方式（老的启动.bat / npx）重启那套 DSH 时，
     运行态里记的 PID 就过期了。没有自愈的话卡片会一直显示"已停止"，
@@ -738,15 +1189,15 @@ def reconcile_lane(cfg: dict, lane: str) -> dict | None:
 
     成本控制：先查 TCP 表里这个端口有没有监听（0.1ms，一表管所有 lane）、
     再看进程名像不像 node/dsh，最后才做一次带超时的 401 围栏探测。
+    用自动端口的 profile 没有固定端口可查——重启后端口会变，这种只能等"打开"时接管。
     """
-    run = lane_runtime(cfg, lane)
+    run = lane_runtime(cfg, lane, profile)
     if run:
         return run
-    lane_data = cfg.get("lanes", {}).get(lane)
-    if not isinstance(lane_data, dict):
+    port = profile_hint_port(cfg, lane, profile)
+    if not port:
         return None
-    port = int(lane_data.get("port") or 0)
-    pid = listening_pid(port) if port else 0
+    pid = listening_pid(port)
     if not pid or not pid_alive(pid):
         return None
     if not re.search(r"node|dsh|harness", process_image(pid), re.I):
@@ -757,9 +1208,10 @@ def reconcile_lane(cfg: dict, lane: str) -> dict | None:
     write_run(
         cfg,
         lane,
+        profile,
         {
             "lane": lane,
-            "version": lane_data.get("version", "?"),
+            "version": (cfg.get("lanes", {}).get(lane) or {}).get("version", "?"),
             "port": port,
             "pid": pid,
             "url": f"http://127.0.0.1:{port}",
@@ -769,20 +1221,24 @@ def reconcile_lane(cfg: dict, lane: str) -> dict | None:
             "note": "自动重新接管了该端口上的实例（不是本启动器启动的）",
         },
     )
-    return read_run(cfg, lane)
+    return read_run(cfg, lane, profile)
 
 
-def lane_states(cfg: dict, ttl: float = 0.5) -> dict[str, dict | None]:
-    """一次算出**所有** lane 的运行态，复用同一份 TCP 表。
+def lane_states(cfg: dict, ttl: float = 0.5) -> dict[str, dict[str, dict | None]]:
+    """一次算出**所有** lane × profile 的运行态，复用同一份 TCP 表。
 
-    GUI 一轮刷新里要问好几次"这条 lane 在跑吗"（算签名、建卡片、更新计数）。
+    GUI 一轮刷新里要问好几次"这个 profile 在跑吗"（算签名、建卡片、更新计数）。
     每次都重新 reconcile 的话，同一份事实要算三遍；这里一次算完交给调用方复用。
     """
     tcp_listeners(ttl=ttl)  # 预热：后面所有 listening_pid 直接命中缓存
-    out: dict[str, dict | None] = {}
-    for name in cfg.get("lanes", {}):
-        if isinstance(cfg.get("lanes", {}).get(name), dict):
-            out[name] = reconcile_lane(cfg, name)
+    out: dict[str, dict[str, dict | None]] = {}
+    for name, data in cfg.get("lanes", {}).items():
+        if not isinstance(data, dict):
+            continue
+        out[name] = {
+            prof: reconcile_lane(cfg, name, prof)
+            for prof in lane_profiles_view(cfg, name)
+        }
     return out
 
 
@@ -1131,10 +1587,34 @@ def install_version(cfg: dict, version: str, follow: bool = True,
 # ======================= lane 管理 =======================
 
 
+def preferred_ports(cfg: dict) -> set[int]:
+    """全部 lane × profile 的端口偏好（接管 lane 的 3080、手动写进配置的提示）。"""
+    used: set[int] = set()
+    for data in cfg.get("lanes", {}).values():
+        if not isinstance(data, dict):
+            continue
+        if data.get("port"):
+            try:
+                used.add(int(data["port"]))
+            except (TypeError, ValueError):
+                pass
+        for hint in (data.get("profiles") or {}).values():
+            if isinstance(hint, dict) and hint.get("port"):
+                try:
+                    used.add(int(hint["port"]))
+                except (TypeError, ValueError):
+                    pass
+    return used
+
+
 def pick_port(cfg: dict, exclude: set[int] | None = None) -> int:
-    """挑一个空闲端口：读一次 TCP 表，再在 port_range 里找第一个既没登记也没人监听的。"""
+    """挑一个空闲端口：读一次 TCP 表，再在 port_range 里找第一个既没登记也没人监听的。
+
+    每次**现场**读表（带 0.5s 缓存）：端口偏好不再是铁定的，谁先起谁得，
+    后起的自动避开——这是"端口不固定、自动避开占用"的落点。
+    """
     lo, hi = cfg.get("port_range", [3080, 3129])
-    used = {int(v.get("port", 0)) for v in cfg["lanes"].values() if isinstance(v, dict)}
+    used = preferred_ports(cfg)
     listening = set(tcp_listeners())
     for port in range(int(lo), int(hi) + 1):
         if exclude and port in exclude:
@@ -1152,36 +1632,13 @@ def find_lane_by_version(cfg: dict, version: str) -> str | None:
     return None
 
 
-# ======================= 主要版本 & 凭据继承 =======================
+# ======================= 凭据（API key）条目复制 =======================
 #
-# 「主要版本」= 你日常真正在用的那条 lane（例如接管来的 global）。
-# 之所以需要这个概念：新装一条 lane 时会得到一份全新的空 DSH_HOME，
-# 里面没有 API key，第一次启动要你手动填一遍。而这个 key 本来就是同一把，
-# 所以在**创建时**从主要版本复制一次即可，之后各 lane 不再联动（要换自己改）。
+# 设计说明（v0.3 起取消「主要版本自动继承」）：API key 属于哪个环境由用户自己决定，
+# 启动器提供**按条目复制**——源 HOME 的 .credentials.yaml 里有哪些提供商条目
+# （refs 段，如 DEEPSEEK_API_KEY），勾选其中几条复制到目标 HOME，其它一概不碰。
 
 CRED_FILENAME = ".credentials.yaml"
-
-
-def primary_lane(cfg: dict) -> str | None:
-    """当前标记的主要版本 lane 名（未设置或已失效时返回 None）。"""
-    name = str(cfg.get("primary") or "").strip()
-    if name and isinstance(cfg.get("lanes", {}).get(name), dict):
-        return name
-    return None
-
-
-def ordered_lanes(cfg: dict) -> list[tuple[str, dict]]:
-    """主要版本永远排第一，其余保持登记顺序（sorted 是稳定排序）。"""
-    lanes = [(n, d) for n, d in cfg.get("lanes", {}).items() if isinstance(d, dict)]
-    top = primary_lane(cfg)
-    if not top:
-        return lanes
-    return sorted(lanes, key=lambda kv: 0 if kv[0] == top else 1)
-
-
-def set_primary(cfg: dict, lane: str | None) -> None:
-    cfg["primary"] = lane or ""
-    save_config(cfg)
 
 
 def credentials_path(home) -> Path:
@@ -1271,36 +1728,37 @@ def merge_credential_refs(path: Path, refs: dict[str, str]) -> list[str]:
     return touched
 
 
-def inherit_credentials(cfg: dict, lane: str) -> dict:
-    """新建 lane 时从主要版本复制一次 API key（只复制 refs，不复制会话/设置/登录态）。
+def copy_credential_refs(cfg: dict, src: str, dst: str,
+                         only: set[str] | None = None) -> dict:
+    """把源 lane HOME 凭据里的**指定条目**复制到目标 lane HOME（只动 refs 段，不碰其它内容）。
 
-    返回一份可打印的结果说明，供 create / adopt / GUI 复用。
+    only=None ＝ 全部条目；否则只复制列出的键（提供商条目，如 DEEPSEEK_API_KEY）。
+    返回可打印的结果说明，供 CLI / GUI 复用。
     """
-    data = cfg["lanes"][lane]
-    home = Path(data.get("home") or (paths(cfg)["homes"] / lane))
     out = {
-        "lane": lane,
-        "source": None,
-        "home": str(home),
-        "path": str(credentials_path(home)),
+        "src": src,
+        "dst": dst,
+        "src_home": str(lane_home(cfg, src)),
+        "dst_home": str(lane_home(cfg, dst)),
+        "path": "",
         "available": [],
+        "selected": [],
         "written": [],
+        "unknown": [],
         "error": None,
         "skipped": None,
     }
-
-    src = primary_lane(cfg)
-    if not src:
-        out["skipped"] = "还没有设置主要版本"
+    if src not in cfg.get("lanes", {}) or dst not in cfg.get("lanes", {}):
+        out["error"] = "源或目标 lane 不存在"
         return out
-    if src == lane:
-        out["skipped"] = "它自己就是主要版本"
+    if src == dst:
+        out["skipped"] = "源和目标是同一条 lane"
         return out
-    src_home = Path(cfg["lanes"][src].get("home") or (paths(cfg)["homes"] / src))
-    out["source"] = src
+    src_home = lane_home(cfg, src)
+    dst_home = lane_home(cfg, dst)
     try:
-        if src_home.resolve() == home.resolve():
-            out["skipped"] = f"与主要版本「{src}」用的是同一个 DSH_HOME，无需复制"
+        if src_home.resolve() == dst_home.resolve():
+            out["skipped"] = "两条 lane 用的是同一个 DSH_HOME，无需复制"
             return out
     except Exception:
         pass
@@ -1309,29 +1767,39 @@ def inherit_credentials(cfg: dict, lane: str) -> dict:
     out["available"] = sorted(refs)
     if not refs:
         out["error"] = (
-            f"主要版本「{src}」的 {credentials_path(src_home)} 里没有 refs 段，"
-            f"没有 API key 可复制"
+            f"源 lane「{src}」的 {credentials_path(src_home)} 里没有 refs 段，没有可复制的条目"
         )
         return out
+    selected = sorted(refs) if not only else [k for k in sorted(refs) if k in only]
+    out["unknown"] = sorted(only - set(refs)) if only else []
+    if not selected:
+        out["error"] = "选中的条目在源凭据里一个都不存在"
+        return out
+    out["selected"] = selected
+    out["path"] = str(credentials_path(dst_home))
     try:
-        out["written"] = merge_credential_refs(credentials_path(home), refs)
-    except Exception as exc:  # noqa: BLE001
-        # 单条写失败（权限、文件被占）不应该打断整批同步
+        out["written"] = merge_credential_refs(
+            credentials_path(dst_home), {k: refs[k] for k in selected}
+        )
+    except Exception as exc:  # noqa: BLE001 —— 单次写失败不该打断调用方
         out["error"] = f"写入失败：{type(exc).__name__}: {exc}"
     return out
 
 
-def print_inherit_result(res: dict) -> None:
-    """把 inherit_credentials 的结果打成一行控制台说明。"""
+def print_copy_result(res: dict) -> None:
+    """把 copy_credential_refs 的结果打成控制台说明。"""
     if res.get("skipped"):
-        info(f"      API key   : 未复制 —— {res['skipped']}")
-    elif res.get("error"):
-        warn(f"      API key   : 未复制 —— {res['error']}")
-    else:
-        keys = "、".join(res["available"]) or "(无)"
-        extra = "" if res["written"] else "（值已一致，无需改动）"
-        ok(f"      API key   : 已从主要版本「{res['source']}」复制 {len(res['available'])} 项：{keys}{extra}")
-        info(col(f"                  → {res['path']}", C.GRAY))
+        info(f"      凭据      : 未复制 —— {res['skipped']}")
+        return
+    if res.get("error"):
+        warn(f"      凭据      : 未复制 —— {res['error']}")
+        if res.get("unknown"):
+            info(col(f"                  其中源里没有的条目：{'、'.join(res['unknown'])}", C.GRAY))
+        return
+    extra = "" if res["written"] else "（值已一致，无需改动）"
+    ok(f"      凭据      : 已从「{res['src']}」复制 {len(res['selected'])} 项到「{res['dst']}」"
+       f"：{'、'.join(res['selected'])}{extra}")
+    info(col(f"                  → {res['path']}", C.GRAY))
 
 
 def resolve_target(cfg: dict, target: str) -> str:
@@ -1347,7 +1815,6 @@ def resolve_target(cfg: dict, target: str) -> str:
         name = target
         cfg["lanes"][name] = {
             "version": target,
-            "port": pick_port(cfg),
             "home": str(paths(cfg)["homes"] / name),
             "createdAt": time.strftime("%Y-%m-%d %H:%M:%S"),
             "note": "由 open 自动登记",
@@ -1521,17 +1988,15 @@ def cmd_create(cfg: dict, args) -> int:
                            registries=registry_plan_after(reg, cfg, choice))
     home = paths(cfg)["homes"] / lane
     home.mkdir(parents=True, exist_ok=True)
-    port = args.port or (cfg["lanes"].get(lane, {}) or {}).get("port") or pick_port(cfg)
+    keep = cfg["lanes"].get(lane) if isinstance(cfg["lanes"].get(lane), dict) else {}
     cfg["lanes"][lane] = {
         "version": version,
-        "port": int(port),
         "home": str(home),
         "createdAt": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
+    if isinstance(keep.get("profiles"), dict):
+        cfg["lanes"][lane]["profiles"] = keep["profiles"]
     save_config(cfg)
-
-    # 只在创建这一次复制 API key（之后各 lane 互不影响，要改自己改）
-    inherit = inherit_credentials(cfg, lane)
 
     info("")
     ok(f"lane「{lane}」就绪")
@@ -1539,12 +2004,9 @@ def cmd_create(cfg: dict, args) -> int:
     info(f"      下载源    : {registry_label(reg)}")
     info(f"      安装目录  : {vdir}")
     info(f"      DSH_HOME : {home}")
-    info(f"      端口      : {port}")
-    print_inherit_result(inherit)
-    if not primary_lane(cfg):
-        info("")
-        warn("还没有设置主要版本。设一个之后，以后新建的版本会自动继承它的 API key：")
-        info(col(f"      py {ME_NAME} primary {lane}", C.CYAN))
+    info(col("      端口      : 启动时实时挑空闲端口（open --port N 可现场指定）", C.GRAY))
+    info(col("      凭据      : 新 HOME 是空的。用 copy-key（或界面「凭据…」）"
+             "从其它版本按条目复制 API key", C.GRAY))
     info("")
     info(col(f"  下一步： py {ME_NAME} open {lane}", C.CYAN))
     return 0
@@ -1553,11 +2015,102 @@ def cmd_create(cfg: dict, args) -> int:
 URL_RE = re.compile(r"dsh web:\s*(\S+)")
 
 
+def parse_open_target(cfg: dict, target: str, profile_arg: str | None) -> tuple[str, str]:
+    """把 `lane` / `lane/profile` / `版本`（＋可选 --profile）统一成 (lane, profile)。"""
+    lane_part, sep, prof_part = target.partition("/")
+    lane = resolve_target(cfg, lane_part)
+    profile = (profile_arg or "").strip() or ((prof_part.strip() if sep else "") or DEFAULT_PROFILE)
+    try:
+        validate_profile_name(profile)
+    except ValueError as exc:
+        raise ValueError(str(exc)) from None
+    return lane, profile
+
+
+def detect_pinned_webserver_port(cfg: dict, lane: str,
+                                 profile: str = DEFAULT_PROFILE) -> tuple[int, str, list[str]] | None:
+    """补丁层里有没有把 webserver 端口**钉死**成字面量？返回 (端口, 来源文件, config 原文行)。
+
+    实测场景（2026-09-30，global 及其副本）：web profile 的用户层里有一段工具写入的
+    `webserver` 覆盖行，`config.port: 3080` 是字面量。用户层在组合顺序里压过 bundle 层的
+    `port: !!js ctx.webStartup.port ?? 3080`，于是命令行 `--port` 被**静默忽略**——
+    复制出来的环境端口不受控，两条 lane 还会抢同一个端口。两个补丁层都查（HOME 级的
+    在组合顺序里更靠后、说了算），找到的以 HOME 级为准。
+    """
+    home = lane_home(cfg, lane)
+    found = None
+    for path in (profile_dir(home, profile) / PATCH_LAYER_FILE, Path(home) / PATCH_LAYER_FILE):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        parsed = _extract_webserver_row(text)
+        if parsed:
+            found = (parsed["port"], str(path), parsed["lines"])
+    return found
+
+
+def _extract_webserver_row(text: str) -> dict | None:
+    """在补丁层文本里找 `- id: webserver` 条目及其 config 块（含字面量 port 才算钉住）。"""
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if not re.match(r"^-\s*id:\s*['\"]?webserver['\"]?\s*(#.*)?$", line):
+            continue
+        indent = len(line) - len(line.lstrip())
+        block: list[str] = []
+        for nxt in lines[index + 1:]:
+            if nxt.strip() and not nxt.lstrip().startswith("#"):
+                nxt_indent = len(nxt) - len(nxt.lstrip())
+                if nxt_indent <= indent:
+                    break
+            block.append(nxt)
+        port = None
+        for raw in block:
+            m = re.match(r"^\s*port:\s*['\"]?(\d+)['\"]?\s*(?:#.*)?$", raw)
+            if m:
+                port = int(m.group(1))
+                break
+        if port is not None:
+            return {"port": port, "lines": block}
+    return None
+
+
+def write_port_override(cfg: dict, lane: str, profile: str,
+                        pinned_rows: list[str], port: int) -> Path:
+    """写一个 `--patch` 临时覆盖层，把 webserver 的 port 按本次启动的要求改掉。
+
+    `--patch` 在组合顺序里排在两个用户层之后，所以能压过钉死的端口。config 其它键
+    （host / compression …）从钉住的那行原样抄过来，只换 port——这样无论宿主的
+    config 合并语义是按键合并还是整块替换，结果都一致。
+    """
+    path = paths(cfg)["logs"] / f".port-override-{lane}__{profile}.yml"
+    body: list[str] = []
+    for raw in pinned_rows:
+        # 只抄 config 的键值行：`name:` 和 `config:` 这两行不带（config: 由下面统一补），
+        # 否则会拼出 "config 里套 name / 两个 config:" 的坏 YAML
+        if re.match(r"^\s*name:\s", raw) or re.match(r"^\s*config:\s*$", raw):
+            continue
+        m = re.match(r"^(\s*)port:\s*['\"]?\d+['\"]?\s*(?:#.*)?$", raw)
+        body.append(f"{m.group(1)}port: {port}" if m else raw)
+    text = (
+        f"# dsh-lanes 临时覆盖（启动器自动生成，本次启动把 webserver 端口定为 {port}）\n"
+        f"# 原因：你的补丁层把端口钉成了字面量，命令行 --port 会被它压住。\n"
+        f"# 不想被覆盖：把启动端口填成钉住的值，或删掉补丁层里 webserver 行的 port。\n"
+        "- id: webserver\n"
+        "  config:\n" + "\n".join(body) + "\n"
+    )
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
 def cmd_open(cfg: dict, args) -> int:
     try:
-        lane = resolve_target(cfg, args.target)
+        lane, profile = parse_open_target(cfg, args.target, getattr(args, "profile", None))
     except KeyError:
-        fail(f"找不到 lane 或已安装版本「{args.target}」。先跑 versions / create。")
+        fail(f"找不到 lane 或已安装版本「{args.target.partition('/')[0]}」。先跑 versions / create。")
+        return 1
+    except ValueError as exc:
+        fail(str(exc))
         return 1
     try:
         version, vdir, home = require_version_installed(cfg, lane)
@@ -1565,10 +2118,11 @@ def cmd_open(cfg: dict, args) -> int:
         fail(str(exc))
         return 1
 
-    running = lane_runtime(cfg, lane)
+    running = lane_runtime(cfg, lane, profile)
     if running:
         url = running.get("url") or f"http://127.0.0.1:{running.get('port')}"
-        warn(f"lane「{lane}」已在运行（pid {running.get('pid')}，端口 {running.get('port')}）")
+        warn(f"lane「{lane}」的 profile「{profile}」已在运行"
+             f"（pid {running.get('pid')}，端口 {running.get('port')}）")
         info(col(f"  {url}", C.CYAN))
         if cfg.get("open_browser", True) and not args.no_browser:
             webbrowser.open(url)
@@ -1578,44 +2132,95 @@ def cmd_open(cfg: dict, args) -> int:
     if not node:
         fail("找不到 node")
         return 1
-    port = args.port or int(cfg["lanes"][lane].get("port") or 0) or pick_port(cfg)
-    holder = listening_pid(port)
-    if holder:
-        # 端口上已经有东西。如果那是个 DSH 实例（例如你用老方式启动的那套），
-        # 就"接管"它：不重复起第二个进程，把它的 PID 记进运行态，之后就能从这里停掉。
-        pid = holder
-        if pid and pid_alive(pid) and probe_dsh_like(port):
-            started = process_start_time(pid) or time.strftime("%Y-%m-%d %H:%M:%S")
-            url = f"http://127.0.0.1:{port}"
-            write_run(
-                cfg,
-                lane,
-                {
-                    "lane": lane,
-                    "version": version,
-                    "port": port,
-                    "pid": pid,
-                    "url": url,
-                    "adopted": True,
-                    "installedAt": cfg["lanes"][lane].get("installDir", ""),
-                    "procStartedAt": started,
-                    "startedAt": started,
-                    "note": "接管了原本就在这个端口上运行的实例（不是本启动器启动的）",
-                },
+
+    # ── 端口：不固定，启动时现场定 ──
+    # 优先级：--port ＞ profile 的端口偏好（接管 lane 靠它认回 3080）＞ 实时挑空闲。
+    # 偏好的端口被占用时**自动改口**（端口本来就是每启动一次现场挑的，不值得为它失败）；
+    # 唯一的例外：默认 profile（web）+ 端口上是个 DSH 实例 + 没有别的运行态认领它
+    # ——那多半是你用老方式启动的那一套，"接管"它而不是绕开它。
+    #
+    # 补丁层钉死端口的例外：有的工具会在补丁层里把 webserver 端口写死（用户层压过
+    # bundle 层，命令行 --port 被静默忽略）。没指定端口时把钉住的值当第一偏好：
+    # 空闲就顺着它用（兼容写这块配置的工具）；被占用就走下面的接管/改口逻辑，
+    # 最终端口和钉住值不一致时，再写一个 --patch 覆盖层让本次启动说了算。
+    try:
+        pin = detect_pinned_webserver_port(cfg, lane, profile)
+    except Exception:  # noqa: BLE001 —— 探测失败就当没钉住，不影响启动
+        pin = None
+    explicit_port = getattr(args, "port", None)
+    pref = explicit_port or profile_hint_port(cfg, lane, profile)
+    if pin and not explicit_port:
+        pref = pref or pin[0]
+
+    port: int | None = None
+    if pref:
+        pref = int(pref)
+        holder = listening_pid(pref)
+        if holder == 0:
+            port = pref
+        else:
+            adoptable = (
+                profile == DEFAULT_PROFILE
+                and pid_alive(holder)
+                and probe_dsh_like(pref)
+                and not port_claimed_by_other(cfg, lane, profile, pref)
             )
-            info("")
-            warn(f"端口 {port} 上已经有一个 DSH 实例在跑（pid {pid}，启动于 {started}）")
-            ok("已接管它，不会再起第二个进程；运行态与停止按钮都归本启动器管了")
-            info(col(f"  {url}", C.BOLD + C.CYAN))
-            if args.adopt_only:
+            if adoptable:
+                pid = holder
+                started = process_start_time(pid) or time.strftime("%Y-%m-%d %H:%M:%S")
+                url = f"http://127.0.0.1:{pref}"
+                write_run(
+                    cfg,
+                    lane,
+                    profile,
+                    {
+                        "version": version,
+                        "port": pref,
+                        "pid": pid,
+                        "url": url,
+                        "adopted": True,
+                        "installedAt": cfg["lanes"][lane].get("installDir", ""),
+                        "procStartedAt": started,
+                        "startedAt": started,
+                        "note": "接管了原本就在这个端口上运行的实例（不是本启动器启动的）",
+                    },
+                )
+                info("")
+                warn(f"端口 {pref} 上已经有一个 DSH 实例在跑（pid {pid}，启动于 {started}）")
+                ok("已接管它，不会再起第二个进程；运行态与停止按钮都归本启动器管了")
+                info(col(f"  {url}", C.BOLD + C.CYAN))
+                if getattr(args, "adopt_only", False):
+                    return 0
+                if cfg.get("open_browser", True) and not args.no_browser:
+                    # 这个实例的 token 只存在于它自己的 stdout 里，我们拿不到，
+                    # 只能用裸地址——浏览器里若已有它的登录 cookie 就能直接进。
+                    webbrowser.open(url)
                 return 0
-            if cfg.get("open_browser", True) and not args.no_browser:
-                # 这个实例的 token 只存在于它自己的 stdout 里，我们拿不到，
-                # 只能用裸地址——浏览器里若已有它的登录 cookie 就能直接进。
-                webbrowser.open(url)
-            return 0
-        fail(f"端口 {port} 已被占用（不是 DSH 实例）。换一个：--port 3083，或先停掉占用者。")
-        return 1
+            image = process_image(holder) or "未知进程"
+            warn(f"端口 {pref} 已被占用（pid {holder}，{Path(image).name}）——自动改用其它空闲端口")
+            try:
+                port = pick_port(cfg, exclude={pref})
+            except RuntimeError as exc:
+                fail(str(exc))
+                return 1
+    else:
+        try:
+            port = pick_port(cfg)
+        except RuntimeError as exc:
+            fail(str(exc))
+            return 1
+
+    # 最终端口和钉住值不一致 → 写临时覆盖层（--patch 在组合顺序里排在两个用户层之后）
+    patch_args: list[str] = []
+    if pin and port is not None and port != pin[0]:
+        try:
+            overlay = write_port_override(cfg, lane, profile, pin[2], int(port))
+            patch_args = ["--patch", str(overlay)]
+            warn(f"补丁层把 webserver 端口钉在 {pin[0]}（{pin[1]}）——本次启动已覆盖为 {port}")
+            warn("  （想一直用钉住的端口：启动时把端口填成它；或删掉补丁层里 webserver 行的 port）")
+        except OSError as exc:
+            warn(f"端口覆盖层写不出来（{exc}）：本次启动可能仍落在钉住的 {pin[0]} 上")
+
     entry = lane_entry_script(cfg, lane)
     if not entry.is_file():
         fail(f"入口缺失：{entry}（建议重新 create，或用 adopt 指向正确的安装树）")
@@ -1630,14 +2235,18 @@ def cmd_open(cfg: dict, args) -> int:
         cwd = Path.home()
 
     p = ensure_layout(cfg)
-    log = p["logs"] / f"{lane}.log"
-    cmd = [node, str(entry), "web", "--port", str(port), "--no-open"]
+    log = p["logs"] / f"{lane}__{profile}.log"
+    # `dsh <名>` 就是 `dsh --profile <名>` 的缩写（bin.js 的展开规则）；这里写全称。
+    # 启动器自己的旗标（--profile / --patch）必须排在应用参数（--port / --no-open）
+    # 之前——pass-through 从第一个未知旗标开始，顺序错了 --patch 会被塞给 web 应用。
+    cmd = [node, str(entry), "--profile", profile, *patch_args,
+           "--port", str(port), "--no-open"]
 
-    info(col(f"── 启动 lane「{lane}」──", C.BOLD))
+    info(col(f"── 启动 lane「{lane}」· profile「{profile}」──", C.BOLD))
     info(f"      版本      : {version}")
     info(f"      DSH_HOME : {home}")
     info(f"      工作区    : {cwd}")
-    info(f"      端口      : {port}")
+    info(f"      端口      : {port}" + (f"（偏好的 {pref} 被占，已自动改口）" if pref and port != pref else ""))
     info(f"      日志      : {log}")
     info("")
 
@@ -1668,8 +2277,8 @@ def cmd_open(cfg: dict, args) -> int:
         write_run(
             cfg,
             lane,
+            profile,
             {
-                "lane": lane,
                 "version": version,
                 "port": port,
                 "pid": proc.pid,
@@ -1702,13 +2311,19 @@ def cmd_open(cfg: dict, args) -> int:
                 thread.join(timeout=2)
                 if proc.poll() is None:
                     kill_tree(proc.pid)
-                clear_run(cfg, lane)
+                clear_run(cfg, lane, profile)
                 return 1
-            data = read_run(cfg, lane) or {}
+            data = read_run(cfg, lane, profile) or {}
             data["url"] = url
-            write_run(cfg, lane, data)
+            # 以 URL 为准校正端口：万一宿主没按请求的端口监听（例如旧版组合里有
+            # 覆盖层压住了 --port），运行态记录的必须是真的，否则停止/认回都会找错
+            m_port = re.match(r"https?://[^/:]+:(\d+)(?:/|$)", url)
+            if m_port and int(m_port.group(1)) != int(port):
+                warn(f"实际监听端口是 {m_port.group(1)}，不是请求的 {port}——运行态按实际端口记录")
+                data["port"] = int(m_port.group(1))
+            write_run(cfg, lane, profile, data)
             info("")
-            ok(f"lane「{lane}」已启动并验证通过（{detail}）")
+            ok(f"lane「{lane}」的 profile「{profile}」已启动并验证通过（{detail}）")
             info(col(f"  {url}", C.BOLD + C.CYAN))
             if cfg.get("open_browser", True) and not args.no_browser:
                 webbrowser.open(url)
@@ -1722,17 +2337,17 @@ def cmd_open(cfg: dict, args) -> int:
             thread.join(timeout=2)
             if proc.poll() is None:
                 kill_tree(proc.pid)
-            clear_run(cfg, lane)
+            clear_run(cfg, lane, profile)
             return 1
 
         if args.detach:
             info(col("  已转入后台（--detach）。停止： "
-                    f"py {ME_NAME} stop {lane}", C.GRAY))
+                     f"py {ME_NAME} stop {lane}/{profile}", C.GRAY))
             stop.set()
             thread.join(timeout=2)
             return 0
 
-        info(col("  按 Ctrl+C 停止该 lane。", C.GRAY))
+        info(col(f"  按 Ctrl+C 停止该 profile（{lane}/{profile}）。", C.GRAY))
         try:
             while proc.poll() is None:
                 time.sleep(0.5)
@@ -1744,8 +2359,8 @@ def cmd_open(cfg: dict, args) -> int:
             thread.join(timeout=2)
             if proc.poll() is None:
                 kill_tree(proc.pid)
-            clear_run(cfg, lane)
-            ok("lane 已停止")
+            clear_run(cfg, lane, profile)
+            ok("profile 已停止")
     return 0
 
 
@@ -1840,17 +2455,24 @@ def cmd_adopt(cfg: dict, args) -> int:
         "kind": "adopted",
         "source": target["source"],
         "createdAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+        # 端口记成默认 profile（web）的偏好：下次 open 先试它，好把已在跑的那套接管回来；
+        # 被占且不是 DSH 时会自动改口，不会卡死
+        "profiles": {DEFAULT_PROFILE: {"port": port, "createdAt": time.strftime("%Y-%m-%d %H:%M:%S")}},
     }
     save_config(cfg)
-    inherit = inherit_credentials(cfg, lane)
     info("")
     ok(f"已把「{target['source']}」注册为 lane「{lane}」")
     info(f"      版本      : {target['version']}")
     info(f"      安装目录  : {target['path']}")
     info(f"      DSH_HOME : {home}")
-    info(f"      端口      : {port}")
-    print_inherit_result(inherit)
+    info(f"      默认端口  : {port}（web profile 的偏好；被占用会自动改口）")
+    info(col("      凭据      : 用它现有的 HOME，里面已有你的 API key；", C.GRAY))
+    info(col("                需要复制给别的 lane 时用 copy-key（或界面「凭据…」）按条目复制", C.GRAY))
     warn("这条 lane 用的是你现有的 DSH_HOME（含已有会话 / 设置 / 插件），不是隔离 home。")
+    profs = disk_profiles(home)
+    if profs:
+        info(col(f"      profiles  : HOME 里现成的环境：{'、'.join(profs)}"
+                 f"（open {lane}/<名> 直接用，或 profile-add 再建）", C.GRAY))
     info("")
     info(
         col(
@@ -1868,63 +2490,109 @@ def cmd_list(cfg: dict, args) -> int:
     if not lanes:
         info(col("  （还没有 lane。用 create 建一条，例如：create next 0.1.7-rc.2）", C.GRAY))
         return 0
-    top = primary_lane(cfg)
-    info(f"  {'':<3}{'lane':<12}{'版本':<16}{'端口':<7}{'状态':<10}DSH_HOME")
-    info("  " + "─" * 78)
-    for name, lane in ordered_lanes(cfg):
+    info(f"  {'lane':<18}{'版本':<16}{'profile':<14}{'状态':<18}端口")
+    info("  " + "─" * 84)
+    for name, lane in lanes.items():
+        if not isinstance(lane, dict):
+            continue
         ver = lane.get("version", "?")
-        port = lane.get("port", "-")
-        rt = reconcile_lane(cfg, name)  # 顺带自愈：端口上有实例就自动接管
-        plain = f"运行中 {rt['pid']}" if rt else "已停止"
-        state = col(f"{plain:<14}", C.GREEN if rt else C.GRAY)
-        mark = col("★", C.CYAN) if name == top else " "
-        info(f"  {mark:<3}{name:<12}{ver:<16}{str(port):<7}{state}{lane.get('home', '')}")
-        if rt and rt.get("url"):
-            info(col(f"                  {rt['url']}", C.CYAN))
-    if top:
-        info("")
-        info(col(f"  ★ = 主要版本（{top}）：新建的 lane 会自动继承它的 API key。", C.GRAY))
-    else:
-        info("")
-        warn("还没有主要版本。用 primary <lane> 指定，之后新建 lane 会自动继承它的 API key。")
+        states = lane_states(cfg).get(name) or {}
+        view = lane_profiles_view(cfg, name)
+        order = [DEFAULT_PROFILE] + sorted(p for p in view if p != DEFAULT_PROFILE)
+        order = [p for p in order if p in view]
+        for index, prof in enumerate(order):
+            rt = states.get(prof)
+            head = f"  {name:<18}{ver:<16}" if index == 0 else "  " + " " * 35
+            prof_cell = f"{prof:<14}" if index == 0 else f"· {prof:<12}"
+            if rt:
+                state = col(f"运行中 {rt.get('pid')}", C.GREEN)
+                port_text = f"{rt.get('port')}  {rt.get('url') or ''}"
+            else:
+                state = col("已停止", C.GRAY)
+                hint = view[prof].get("port")
+                port_text = f"偏好 {hint}" if hint else "自动挑空闲"
+            info(f"{head}{prof_cell}{state:<28}{port_text}")
+        if not view:
+            info(f"  {name:<12}{ver:<16}{col('（还没有 profile，open 时会自动建 web）', C.GRAY)}")
+    info("")
+    info(col("  端口不固定：每次启动实时挑空闲端口；偏好端口被占用会自动改口。", C.GRAY))
     return 0
 
 
+def _stop_pair(cfg: dict, lane: str, profile: str) -> bool:
+    """停掉一个 (lane, profile)。返回是否真的停了东西。"""
+    rt = read_run(cfg, lane, profile)
+    pid = int(rt.get("pid", 0)) if rt else 0
+    # 没有运行记录时，按这个 profile 的端口偏好把它找回来
+    # （典型场景：用老方式启动的实例，或运行态文件被清过）
+    if not (pid and pid_alive(pid)):
+        port = profile_hint_port(cfg, lane, profile) or 0
+        found = tcp_listeners().get(port, 0) if port else 0
+        if found and pid_alive(found):
+            if probe_dsh_like(port) or re.search(
+                r"node|dsh|harness", process_image(found), re.I
+            ):
+                info(f"「{lane}/{profile}」没有运行记录，但端口 {port} 上有进程 {found}，按端口停止它")
+                pid = found
+            else:
+                warn(f"端口 {port} 被一个不像 DSH 的进程占用（pid {found}），不擅自结束它")
+    label = f"{lane}/{profile}"
+    if pid and pid_alive(pid):
+        started = process_start_time(pid)
+        info(f"正在停止 {label} (pid {pid}{'，启动于 ' + started if started else ''}) …")
+        kill_tree(pid)
+        time.sleep(0.6)
+        if pid_alive(pid):
+            warn(f"{label} 的进程 {pid} 仍存活，请手动检查")
+        else:
+            ok(f"{label} 已停止")
+        clear_run(cfg, lane, profile)
+        return True
+    if rt or profile_hint_port(cfg, lane, profile):
+        warn(f"{label} 没有正在运行的进程")
+    clear_run(cfg, lane, profile)
+    return False
+
+
 def cmd_stop(cfg: dict, args) -> int:
-    targets = args.target or list(cfg.get("lanes", {}).keys())
+    """停止目标：缺省停全部；`stop lane` 停这条 lane 的全部 profile；`stop lane/profile` 停单个。"""
+    targets = args.target or []
     if isinstance(targets, str):
         targets = [targets]
-    any_stopped = False
-    for lane in targets:
-        lane_data = cfg.get("lanes", {}).get(lane) or {}
-        rt = read_run(cfg, lane)
-        pid = int(rt.get("pid", 0)) if rt else 0
-        # 没有运行记录时，按这条 lane 的端口把它找回来
-        # （典型场景：用老方式启动的实例，或运行态文件被清过）
-        if not (pid and pid_alive(pid)):
-            port = int(lane_data.get("port") or 0)
-            found = tcp_listeners().get(port, 0) if port else 0
-            if found and pid_alive(found):
-                if probe_dsh_like(port) or re.search(
-                    r"node|dsh|harness", process_image(found), re.I
-                ):
-                    info(f"lane「{lane}」没有运行记录，但端口 {port} 上有进程 {found}，按端口停止它")
-                    pid = found
-                else:
-                    warn(f"端口 {port} 被一个不像 DSH 的进程占用（pid {found}），不擅自结束它")
-        if pid and pid_alive(pid):
-            started = process_start_time(pid)
-            info(f"正在停止 lane「{lane}」(pid {pid}{'，启动于 ' + started if started else ''}) …")
-            kill_tree(pid)
-            time.sleep(0.6)
-            if pid_alive(pid):
-                warn(f"lane「{lane}」进程 {pid} 仍存活，请手动检查")
+    pairs: list[tuple[str, str]] = []
+    if not targets:
+        for rec in all_run_records(cfg):
+            key = (str(rec.get("lane")), str(rec.get("profile") or DEFAULT_PROFILE))
+            if key not in pairs:
+                pairs.append(key)
+        for lane in cfg.get("lanes", {}):
+            if not isinstance(cfg.get("lanes", {}).get(lane), dict):
+                continue
+            for prof in lane_profiles_view(cfg, lane):
+                if (lane, prof) not in pairs:
+                    pairs.append((lane, prof))
+    else:
+        for target in targets:
+            lane_part, sep, prof_part = target.partition("/")
+            if lane_part not in cfg.get("lanes", {}):
+                try:  # 允许用版本号指 lane（与 open 一致）
+                    lane_part = resolve_target(cfg, lane_part)
+                except KeyError:
+                    warn(f"没有 lane「{lane_part}」，跳过")
+                    continue
+            if sep and prof_part:
+                try:
+                    validate_profile_name(prof_part)
+                except ValueError as exc:
+                    warn(str(exc))
+                    continue
+                pairs.append((lane_part, prof_part))
             else:
-                ok(f"lane「{lane}」已停止")
+                pairs.extend((lane_part, prof) for prof in lane_profiles_view(cfg, lane_part))
+    any_stopped = False
+    for lane, prof in pairs:
+        if _stop_pair(cfg, lane, prof):
             any_stopped = True
-        else:
-            warn(f"lane「{lane}」没有正在运行的进程")
-        clear_run(cfg, lane)
     return 0 if any_stopped or not targets else 1
 
 
@@ -1950,98 +2618,229 @@ def cmd_remove(cfg: dict, args) -> int:
     return 0
 
 
-def cmd_primary(cfg: dict, args) -> int:
-    """标记 / 查看「主要版本」——你日常用的那一套。
-
-    主要版本有两个作用：① 新建 lane 时自动把它的 API key 复制给新 lane；
-    ② 删除它需要二次确认（GUI 里要手打 lane 名）。
-    """
-    lane = getattr(args, "lane", None)
-    if getattr(args, "clear", False):
-        cur = primary_lane(cfg)
-        if not cur:
-            warn("当前本来就没有主要版本标记。")
-            return 0
-        set_primary(cfg, None)
-        ok(f"已清除主要版本标记（原为「{cur}」）")
-        warn("清除后新建的 lane 不会自动继承 API key。")
-        return 0
-
-    if not lane:
-        cur = primary_lane(cfg)
-        if not cur:
-            warn("还没有设置主要版本。用法：primary <lane>，例如 primary global")
-            names = [n for n, _ in ordered_lanes(cfg)]
-            if names:
-                info(col(f"      现有 lane：{'、'.join(names)}", C.GRAY))
-            return 0
-        data = cfg["lanes"][cur]
-        info(col("── 主要版本 ──", C.BOLD))
-        info(f"      lane      : {cur}")
-        info(f"      版本      : {data.get('version')}")
-        info(f"      端口      : {data.get('port')}")
-        info(f"      DSH_HOME : {data.get('home')}")
-        refs = read_credential_refs(data.get("home") or "")
-        info(f"      API key   : {'、'.join(sorted(refs)) if refs else '（还没有，新建版本时复制不到东西）'}")
-        info("")
-        info(col("  它是你日常用的那一套：新建 lane 会自动复制它的 API key（只复制密钥，", C.GRAY))
-        info(col("  会话与设置仍各自独立）；删除它需要二次确认。", C.GRAY))
-        return 0
-
+def cmd_profiles(cfg: dict, args) -> int:
+    """列出一条 lane 的全部 profile（磁盘真值 ∪ 登记提示）与各自运行状态。"""
+    lane = args.lane
     if lane not in cfg.get("lanes", {}):
-        fail(f"没有 lane「{lane}」。先 create 或 adopt。")
+        fail(f"没有 lane「{lane}」")
         return 1
-    if primary_lane(cfg) == lane:
-        info(f"lane「{lane}」已经是主要版本了。")
+    view = lane_profiles_view(cfg, lane)
+    home = lane_home(cfg, lane)
+    info(col(f"── lane「{lane}」的 profiles ──", C.BOLD))
+    info(f"  DSH_HOME : {home}")
+    info(col("  会话 / 凭据 / 设置是 HOME 级共享的；每个 profile 有自己的插件组合与补丁层", C.GRAY))
+    if not view:
+        info(col("  （还没有 profile。open 会自动初始化默认的 web；或用 profile-add 建）", C.GRAY))
         return 0
-    set_primary(cfg, lane)
-    ok(f"已把 lane「{lane}」设为主要版本")
-    refs = read_credential_refs(cfg["lanes"][lane].get("home") or "")
-    if refs:
-        info(f"      以后新建的版本会自动继承：{'、'.join(sorted(refs))}")
-    else:
-        warn("      它的 DSH_HOME 里还没有 API key（.credentials.yaml 无 refs 段），")
-        warn("      新建别的版本时复制不到东西——先把它启动一次并填好 key 再设会更划算。")
+    states = lane_states(cfg).get(lane) or {}
+    order = [DEFAULT_PROFILE] + sorted(name for name in view if name != DEFAULT_PROFILE)
+    order = [name for name in order if name in view]
+    for prof in order:
+        info_col = view[prof]
+        rt = states.get(prof)
+        tags = []
+        if prof == DEFAULT_PROFILE:
+            tags.append("默认")
+        if not info_col["onDisk"]:
+            tags.append("尚未初始化（首次 open 时自动建）")
+        if not info_col["registered"]:
+            tags.append("磁盘上有，未登记")
+        if rt:
+            state = col(f"运行中 pid {rt.get('pid')}　端口 {rt.get('port')}", C.GREEN)
+            url = rt.get("url") or ""
+            if url:
+                state += col(f"　{url}", C.CYAN)
+        else:
+            state = col("已停止", C.GRAY)
+        tail = f"　（{'；'.join(tags)}）" if tags else ""
+        info(f"  · {prof:<16}{state}{tail}")
+    me = ME_NAME
+    info("")
+    info(col(f"  启动指定 profile： py {me} open {lane}/<名> [--port N]", C.CYAN))
+    info(col(f"  新建（复制现有）： py {me} profile-add {lane} <新名> --from <现有>", C.CYAN))
+    info(col(f"  新建（干净环境）： py {me} profile-add {lane} <新名>", C.CYAN))
+    info(col(f"  移除　　　　　　： py {me} profile-rm {lane} <名>", C.CYAN))
     return 0
 
 
-def cmd_sync_key(cfg: dict, args) -> int:
-    """把主要版本的 API key 补齐到已有 lane。
+def cmd_profile_add(cfg: dict, args) -> int:
+    """给一条 lane 新建 profile：干净环境（官方 web 组合）或整目录复制现有 profile。
 
-    新建 lane 时已经自动复制过一次；这条命令是给"在加这个功能之前就建好的
-    lane"补一次的（它们的 DSH_HOME 里只有 browser-session，没有 refs 段）。
+    · 干净：按 dsh-app-boot initProfile 的形状建目录（package.json + cordis.patch.yml
+      + pnpm-workspace.yaml），官方组合包由宿主启动时从安装树解析，不需要预装；
+    · --from：整目录复制源 profile（含已装插件），junction 按副本路径重建，
+      pnpm 账本里指回源 profile 的路径就地改写。
     """
-    names = list(getattr(args, "lane", None) or [n for n, _ in ordered_lanes(cfg)])
-    src = primary_lane(cfg)
-    if not src:
-        fail("还没有设置主要版本。先跑：primary <lane>")
+    lane = args.lane
+    name = args.name
+    if lane not in cfg.get("lanes", {}):
+        fail(f"没有 lane「{lane}」")
         return 1
-    refs = read_credential_refs(cfg["lanes"][src].get("home") or "")
-    if not refs:
-        fail(f"主要版本「{src}」的 DSH_HOME 里没有 API key（refs 段为空），没有东西可同步。")
-        info(col(f"      该文件：{credentials_path(cfg['lanes'][src].get('home') or '')}", C.GRAY))
+    try:
+        validate_profile_name(name)
+    except ValueError as exc:
+        fail(str(exc))
+        return 1
+    view = lane_profiles_view(cfg, lane)
+    if name in view and view[name]["onDisk"]:
+        fail(f"profile「{name}」已经存在（{lane_home(cfg, lane) / 'profiles' / name}）")
         return 1
 
-    info(col(f"── 把主要版本「{src}」的 API key 同步到其它 lane ──", C.BOLD))
-    info(f"  主要版本现有：{'、'.join(sorted(refs))}")
+    home = lane_home(cfg, lane)
+    dst = home / "profiles" / name
+    me = ME_NAME
+    if getattr(args, "from_profile", None):
+        src_name = str(args.from_profile).strip()
+        if src_name == name:
+            fail("源 profile 和目标不能同名")
+            return 1
+        if src_name not in view or not view[src_name]["onDisk"]:
+            fail(f"源 profile「{src_name}」在磁盘上不存在（现有：{'、'.join(sorted(view)) or '无'}）")
+            return 1
+        src = home / "profiles" / src_name
+        info(col(f"── 复制 profile：{lane}/{src_name} → {lane}/{name} ──", C.BOLD))
+        info(f"  源目录    {src}")
+        info(f"  目标目录  {dst}")
+        if lane_runtime(cfg, lane, src_name):
+            warn(f"源 profile「{src_name}」正在运行：正在写入的文件可能复制到一半（其它内容不受影响）")
+        stats = copy_tree(src, dst)
+        rel = relink_junctions(src, dst, [(src, dst)])
+        info(col(f"  复制 {stats['files']} 个文件 / {human_size(stats['bytes'])}，"
+                 f"重建链接 {rel['made']}/{rel['total']} 个", C.GRAY))
+        fixed = 0
+        for relpath in ("node_modules/.modules.yaml", "pnpm-lock.yaml", "node_modules/.pnpm/lock.yaml"):
+            path = dst / relpath
+            try:
+                if not path.is_file():
+                    continue
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            replaced = text.replace(str(src), str(dst)).replace(str(src).replace("\\", "/"), str(dst).replace("\\", "/"))
+            if replaced != text:
+                try:
+                    shutil.copyfile(path, path.with_suffix(path.suffix + ".bak"))
+                    path.write_text(replaced, encoding="utf-8")
+                    fixed += 1
+                except OSError as exc:
+                    warn(f"  {relpath} 改写失败：{exc}")
+        if fixed:
+            info(col(f"  已把 {fixed} 个 pnpm 账本文件里指回源 profile 的路径改成本 profile 的", C.GRAY))
+        if stats["errors"]:
+            fail(f"有 {len(stats['errors'])} 个条目没能复制——这个副本不可信：")
+            for path_text, reason in stats["errors"][:4]:
+                info(col(f"      {path_text}：{reason}", C.GRAY))
+            info(col(f"      清掉重来： py {me} profile-rm {lane} {name} --yes", C.CYAN))
+            return 1
+        ok(f"profile「{name}」已创建（复制自 {src_name}，含已装插件）")
+    else:
+        info(col(f"── 新建 profile：{lane}/{name}（干净环境，官方 web 组合）──", C.BOLD))
+        init_profile_dir(dst, SHIPPED_TEMPLATES["web"])
+        ok(f"profile「{name}」已创建（{dst}）")
+        info(col("      里面还没有任何插件；启动后到 DSH 的插件市场里装，或：", C.GRAY))
+        info(col(f"      py {me} profile-add {lane} {name} --from {DEFAULT_PROFILE} 可改成完整复制", C.GRAY))
+
+    set_profile_hint(cfg, lane, name, createdAt=time.strftime("%Y-%m-%d %H:%M:%S"))
     info("")
-    checked = 0
-    changed = 0
-    for lane in names:
-        if lane not in cfg.get("lanes", {}):
-            warn(f"没有 lane「{lane}」，跳过")
-            continue
-        checked += 1
-        info(f"  · {lane}")
-        res = inherit_credentials(cfg, lane)
-        print_inherit_result(res)
-        if res.get("written"):
-            changed += 1
-    info("")
-    ok(f"完成：检查 {checked} 条，实际写入 {changed} 条。")
-    if changed:
-        info(col("  注意：正在运行中的实例要重启一次才会用上新的 key。", C.GRAY))
+    info(col(f"  启动： py {me} open {lane}/{name}        （端口自动挑空闲，--port 可现场指定）", C.CYAN))
     return 0
+
+
+def cmd_profile_rm(cfg: dict, args) -> int:
+    """移除一个 profile：删目录 + 运行态 + 登记提示。默认 profile（web）不删。"""
+    lane = args.lane
+    name = args.name
+    if lane not in cfg.get("lanes", {}):
+        fail(f"没有 lane「{lane}」")
+        return 1
+    if name == DEFAULT_PROFILE:
+        fail(f"profile「{name}」是默认 profile（插件市场 / 核对等功能都以它为默认对象），不允许移除")
+        return 1
+    if lane_runtime(cfg, lane, name):
+        fail(f"profile「{lane}/{name}」正在运行，先停再删： py {ME_NAME} stop {lane}/{name}")
+        return 1
+    view = lane_profiles_view(cfg, lane)
+    pdir = lane_home(cfg, lane) / "profiles" / name
+    if name in view and not view[name]["onDisk"]:
+        # 只是登记提示（没建到磁盘）——清登记就行
+        set_profile_hint(cfg, lane, name, remove=True)
+        clear_run(cfg, lane, name)
+        ok(f"已移除登记提示「{lane}/{name}」（磁盘上本来就没有目录）")
+        return 0
+    if not pdir.is_dir():
+        fail(f"profile「{name}」在磁盘上不存在：{pdir}")
+        return 1
+    size = dir_size(pdir)
+    if not getattr(args, "yes", False):
+        try:
+            typed = input(f"  确认删除 profile「{lane}/{name}」（{human_size(size)}）？"
+                          f"输入 y 回车确认，其它取消：").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            typed = ""
+        if typed not in ("y", "yes", "是"):
+            info("已取消")
+            return 0
+    try:
+        shutil.rmtree(pdir)
+    except OSError as exc:
+        fail(f"删除目录失败：{exc}")
+        return 1
+    set_profile_hint(cfg, lane, name, remove=True)
+    clear_run(cfg, lane, name)
+    ok(f"已移除 profile「{lane}/{name}」（{human_size(size)}）")
+    info(col("  会话与凭据在 HOME 级，不受影响；这个 profile 里装的插件没了。", C.GRAY))
+    return 0
+
+
+def cmd_keys(cfg: dict, args) -> int:
+    """列出一条 lane 的凭据条目（.credentials.yaml 的 refs 段，即各提供商的 key 引用）。"""
+    lane = args.lane
+    if lane not in cfg.get("lanes", {}):
+        fail(f"没有 lane「{lane}」")
+        return 1
+    home = lane_home(cfg, lane)
+    path = credentials_path(home)
+    refs = read_credential_refs(home)
+    info(col(f"── lane「{lane}」的凭据条目 ──", C.BOLD))
+    info(f"  {path}")
+    if not refs:
+        warn("  （没有 refs 段——这个 HOME 里还没有 API key）")
+        return 0
+    for key in sorted(refs):
+        info(f"  · {key}")
+    info("")
+    info(col(f"  复制到别的 lane： py {ME_NAME} copy-key {lane} <目标lane> [--only {sorted(refs)[0]}]", C.CYAN))
+    return 0
+
+
+def cmd_copy_key(cfg: dict, args) -> int:
+    """在 lane 之间按条目复制 API key：源 → 目标，--only 挑条目，缺省全部。"""
+    src = args.source
+    dst = args.dest
+    for name in (src, dst):
+        if name not in cfg.get("lanes", {}):
+            fail(f"没有 lane「{name}」。先 create / adopt，或用 keys <lane> 看现有 lane。")
+            return 1
+    only = {x.strip() for x in (getattr(args, "only", None) or "").split(",") if x.strip()}
+    refs = read_credential_refs(lane_home(cfg, src))
+    if not refs:
+        fail(f"源 lane「{src}」的 HOME 里没有凭据条目（keys {src} 可查看）")
+        return 1
+    if only:
+        unknown = only - set(refs)
+        if unknown:
+            warn(f"源里没有这些条目（跳过）：{'、'.join(sorted(unknown))}")
+        info(col(f"── 复制凭据条目：{src} → {dst} ──", C.BOLD))
+        info(f"  已选条目  {'、'.join(sorted(only & set(refs))) or '（无）'}")
+    else:
+        info(col(f"── 复制凭据条目：{src} → {dst}（全部）──", C.BOLD))
+        info(f"  源条目    {'、'.join(sorted(refs))}")
+    res = copy_credential_refs(cfg, src, dst, only=only or None)
+    print_copy_result(res)
+    if res.get("written"):
+        info(col("  注意：目标正在运行中的实例要重启一次才会用上新的 key。", C.GRAY))
+        return 0
+    return 0 if not res.get("error") else 1
 
 
 def dir_size(path: Path, limit: int = 60000) -> int:
@@ -2485,9 +3284,10 @@ def cmd_clone(cfg: dict, args) -> int:
             fail(f"空间不足：需要约 {human_size(need)}，只剩 {human_size(plan['free'])}")
             return 1
 
-    src_state = lane_runtime(cfg, src)
+    src_state = lane_any_running(cfg, src)
     if src_state:
-        warn(f"源 lane「{src}」正在运行：正在写入的那个会话文件可能复制到一半（其它内容不受影响）")
+        warn(f"源 lane「{src}」有 profile 正在运行（{src_state.get('profile')}）："
+             "正在写入的那个会话文件可能复制到一半（其它内容不受影响）")
 
     started = time.time()
     last = {"t": 0.0}
@@ -2522,16 +3322,20 @@ def cmd_clone(cfg: dict, args) -> int:
              f"（重定向 {rel['remapped']} 个，源里已悬空跳过 {rel['dangling']} 个）", C.GRAY))
 
     info(col("  [4/4] 登记新 lane…", C.CYAN))
-    port = int(args.port) if getattr(args, "port", None) else pick_port(cfg)
+    src_view = lane_profiles_view(cfg, src)
     cfg["lanes"][new] = {
         "version": plan["src_version"],
-        "port": port,
         "home": str(plan["home"]),
         "installDir": str(plan["install"]),
         "kind": "clone",
         "clonedFrom": src,
         "createdAt": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
+    if src_view:
+        # HOME 里的 profile 目录已经整棵复制过来了，把名字也登记上（端口偏好不带：新环境重新挑）
+        cfg["lanes"][new]["profiles"] = {
+            name: {"createdAt": time.strftime("%Y-%m-%d %H:%M:%S")} for name in sorted(src_view)
+        }
     save_config(cfg)
 
     errors = list(st_install["errors"]) + list(st_home["errors"])
@@ -2541,7 +3345,9 @@ def cmd_clone(cfg: dict, args) -> int:
     ok(f"lane「{new}」已就绪（复制自 {src}，版本 {plan['src_version']}）")
     info(f"      安装目录  : {plan['install']}")
     info(f"      DSH_HOME  : {plan['home']}")
-    info(f"      端口      : {port}")
+    info(col("      端口      : 启动时实时挑空闲端口", C.GRAY))
+    if src_view:
+        info(col(f"      profiles  : {'、'.join(sorted(src_view))}（随 HOME 一起复制过来了）", C.GRAY))
     info(f"      复制内容  : {st_install['files'] + st_home['files']} 个文件 / "
          f"{human_size(st_install['bytes'] + st_home['bytes'])}，用时 {elapsed:.1f}s")
     info(f"      会话文件  : {count_sessions(plan['home'])} 个"
@@ -2739,7 +3545,7 @@ def cmd_upgrade(cfg: dict, args) -> int:
         ok(f"lane「{lane}」已经就是 {version}，不用动")
         return 0
 
-    running = lane_runtime(cfg, lane)
+    running = lane_any_running(cfg, lane)
     was_running = bool(running)
 
     if getattr(args, "dry_run", False):
@@ -2815,7 +3621,7 @@ def cmd_upgrade(cfg: dict, args) -> int:
         if smoke_ok:
             ok("起来过，又停回去了")
         else:
-            fail(f"起不来。日志：{p['logs'] / (lane + '.log')}")
+            fail(f"起不来。日志：{lane_log_path(cfg, lane)}")
 
     if fatal or not smoke_ok:
         info("")
@@ -2877,11 +3683,13 @@ def cmd_verify(cfg: dict, args) -> int:
         return 1
     entry = lane_entry_script(cfg, lane)
     pkg_dir = package_dir_of_entry(entry)
+    prof = getattr(args, "profile", None) or PROFILE_NAME
     info(col(f"── 核对 lane「{lane}」──", C.BOLD))
     info(f"  版本      : {version}")
     info(f"  安装树    : {vdir}")
     info(f"  dsh 包目录: {pkg_dir}")
     info(f"  DSH_HOME  : {home}")
+    info(f"  profile   : {prof}")
 
     problems: list[str] = []
     try:
@@ -3018,16 +3826,16 @@ def cmd_verify(cfg: dict, args) -> int:
     # pnpm 账本（.modules.yaml）：复制出来的副本会带着**原件**的 virtualStoreDir。
     # 它平时不影响启动、也不报错，但一旦要用 pnpm 给这条 lane 装/更新插件，
     # pnpm 会直接拒绝干活（ERR_PNPM_UNEXPECTED_VIRTUAL_STORE），而且它指的是别条 lane 的目录。
-    ledger = pnpm_ledger_state(cfg, lane, PROFILE_NAME)
+    ledger = pnpm_ledger_state(cfg, lane, prof)
     if ledger["exists"]:
         info(f"  pnpm 账本 : store={ledger['store'] or '?'}")
         info(col(f"              virtualStore={ledger['virtual'] or '?'}", C.GRAY))
         if ledger["outside"]:
             if getattr(args, "fix", False):
-                rep = repair_pnpm_virtual_store(cfg, lane, PROFILE_NAME)
+                rep = repair_pnpm_virtual_store(cfg, lane, prof)
                 if rep["changed"]:
                     info(col(f"      --fix：已改成 {rep['want']}", C.CYAN))
-                    ledger = pnpm_ledger_state(cfg, lane, PROFILE_NAME)
+                    ledger = pnpm_ledger_state(cfg, lane, prof)
                 else:
                     warn(f"      --fix 没能改动：{rep['error'] or '没找到该字段'}")
             if ledger["outside"]:
@@ -3043,15 +3851,15 @@ def cmd_verify(cfg: dict, args) -> int:
 
     # 本地插件（`file:` 依赖）：pnpm 把解析结果记成相对路径，换个深度就指不到地方。
     # 复制/搬动之后必然遇到，所以这里也核一遍（实测报错长这样：ENOENT scandir 'D:\...\Desktop\...'）。
-    file_specs = pnpm_file_spec_state(cfg, lane, PROFILE_NAME)
+    file_specs = pnpm_file_spec_state(cfg, lane, prof)
     for item in file_specs:
         if item["broken"]:
             if getattr(args, "fix", False):
-                rep = repair_pnpm_file_specs(cfg, lane, PROFILE_NAME)
+                rep = repair_pnpm_file_specs(cfg, lane, prof)
                 if rep["changed"]:
                     for line in rep["changed"]:
                         info(col(f"      --fix：{line}", C.CYAN))
-                    file_specs = pnpm_file_spec_state(cfg, lane, PROFILE_NAME)
+                    file_specs = pnpm_file_spec_state(cfg, lane, prof)
                     break
             problems.append(
                 f"本地依赖 {item['name']} 指不到地方：{item['lock'] or item['specifier']} → "
@@ -3063,11 +3871,21 @@ def cmd_verify(cfg: dict, args) -> int:
 
     # 补丁层体检（2026-09-27 那次故障的防线）：真解析一遍 + 市场读不读得到。
     # 这是"下一次启动会不会直接挂"的唯一提前判据 —— 补丁层坏了，症状只会出现在启动那一刻。
-    for patch_path in (profile_dir(home) / PATCH_LAYER_FILE, Path(home) / PATCH_LAYER_FILE):
+    for patch_path in (profile_dir(home, prof) / PATCH_LAYER_FILE, Path(home) / PATCH_LAYER_FILE):
         if patch_path.is_file():
             report_patch_layer(cfg, home, pkg_dir, patch_path, problems, vdir)
         else:
             info(col(f"  补丁层    : 无（{patch_path}）", C.GRAY))
+
+    # 钉死端口体检：补丁层里 webserver 的字面量端口会压过命令行 --port（用户层 > bundle 层）。
+    # 启动器 open 时会按需写 --patch 覆盖，但手动跑 `dsh web --port N` 的人会被它静默忽略。
+    try:
+        pin = detect_pinned_webserver_port(cfg, lane, prof)
+    except Exception:  # noqa: BLE001
+        pin = None
+    if pin:
+        warn(f"  端口钉死  : 补丁层把 webserver 端口写死为 {pin[0]}（{pin[1]}）——"
+             "手动 `dsh web --port N` 会被它忽略；用启动器 open 时会按需自动覆盖")
 
     if src and src in cfg["lanes"]:
         if src_home:
@@ -3076,7 +3894,7 @@ def cmd_verify(cfg: dict, args) -> int:
             info(line)
             if a < b:
                 warn("比源 lane 少（源 lane 在复制后又写过会话，或复制时有文件被占用）")
-            ba, bb = profile_bundles(home), profile_bundles(src_home)
+            ba, bb = profile_bundles(home, prof), profile_bundles(src_home, prof)
             if ba is not None and bb is not None:
                 if ba == bb:
                     ok(f"插件清单一致（{len(ba)} 个组合包，含官方 {sum(1 for x in ba if x.startswith('@deepseek-ai/'))} 个）")
@@ -3854,9 +4672,9 @@ def package_kind(home, pkg: str, rows: list[str], profile: str = PROFILE_NAME) -
     return "norows"
 
 
-def lane_skipped_bundles(cfg: dict, lane: str) -> list[str]:
-    """从这条 lane 的启动日志里捡出"被跳过的组合包"（例如版本不兼容）。"""
-    log = paths(cfg)["logs"] / f"{lane}.log"
+def lane_skipped_bundles(cfg: dict, lane: str, profile: str = PROFILE_NAME) -> list[str]:
+    """从这个 profile 的启动日志里捡出"被跳过的组合包"（例如版本不兼容）。"""
+    log = lane_log_path(cfg, lane, profile)
     if not log.is_file():
         return []
     out: list[str] = []
@@ -3880,7 +4698,7 @@ def plugin_listing(cfg: dict, lane: str, profile: str = PROFILE_NAME) -> dict:
     home = lane_home(cfg, lane)
     bundles = read_profile_bundles(home, profile)
     deps = profile_dependencies(home, profile)
-    skip = lane_skipped_bundles(cfg, lane)
+    skip = lane_skipped_bundles(cfg, lane, profile)
     patch_file = plugin_patch_path(cfg, lane, profile)
     text = patch_file.read_text(encoding="utf-8") if patch_file.is_file() else ""
     state = patch_row_state(text)
@@ -4100,7 +4918,8 @@ def cmd_plugins(cfg: dict, args) -> int:
     if lane not in cfg.get("lanes", {}):
         fail(f"没有 lane「{lane}」")
         return 1
-    listing = plugin_listing(cfg, lane)
+    prof = getattr(args, "profile", None) or PROFILE_NAME
+    listing = plugin_listing(cfg, lane, prof)
     me = ME_NAME
     info(col(f"── lane「{lane}」的插件开关（profile {listing['profile']}）──　"
              "（只读；写开关已停用，见 README）", C.BOLD))
@@ -4162,7 +4981,7 @@ def cmd_plugins(cfg: dict, args) -> int:
     if getattr(args, "dump", False):
         info("")
         info(col("  离线组合一次，核对文件与组合结果是否一致…", C.GRAY))
-        dump = run_dump_config(cfg, lane)
+        dump = run_dump_config(cfg, lane, prof)
         if not dump.get("ok"):
             fail(f"组合检查失败（{dump.get('error') or '退出码非 0'}）")
             return 1
@@ -4744,7 +5563,8 @@ def cmd_market(cfg: dict, args) -> int:
     if lane not in cfg.get("lanes", {}):
         fail(f"没有 lane「{lane}」")
         return 1
-    st = market_status(cfg, lane, with_registry=not getattr(args, "offline", False))
+    prof = getattr(args, "profile", None) or PROFILE_NAME
+    st = market_status(cfg, lane, prof, with_registry=not getattr(args, "offline", False))
     me = ME_NAME
     info(col(f"── 插件市场（{MARKET_PKG}）：lane「{lane}」──", C.BOLD))
     installed = st["installed"]
@@ -5852,17 +6672,17 @@ def lane_delete_plan(cfg: dict, lane: str, sizes: bool = True) -> dict:
         "version": data.get("version"),
         "home": home,
         "install": install,
+        "profiles": sorted(lane_profiles_view(cfg, lane)),
         "home_inside": inside(home),
         "install_inside": inside(install) and (not data.get("installDir") or owns_install),
         "adopted": bool(data.get("installDir")) and not owns_install,
         "owns_install": owns_install,
         "kind": data.get("kind") or ("adopted" if data.get("installDir") else "created"),
         "shared_with": [] if owns_install else shared,
-        "log": p["logs"] / f"{lane}.log",
-        "run": p["run"] / f"{lane}.json",
+        "logs": sorted(p["logs"].glob(f"{lane}__*.log")) + [p["logs"] / f"{lane}.log"],
+        "runs": sorted(p["run"].glob(f"{lane}__*.json")) + [p["run"] / f"{lane}.json"],
         "home_size": dir_size(home) if (sizes and home.is_dir()) else None,
         "install_size": dir_size(install) if (sizes and install.is_dir()) else None,
-        "is_primary": primary_lane(cfg) == lane,
     }
 
 
@@ -5875,7 +6695,7 @@ def cmd_delete(cfg: dict, args) -> int:
         return 1
 
     plan = lane_delete_plan(cfg, lane)
-    rt = lane_runtime(cfg, lane)
+    rt = lane_any_running(cfg, lane)
     del_home = (not args.keep_home) and (plan["home_inside"] or args.home_too)
     del_install = (not args.keep_install) and plan["install_inside"] and not plan["shared_with"]
 
@@ -5883,21 +6703,23 @@ def cmd_delete(cfg: dict, args) -> int:
         info("")
         info(col(f"── 删除 lane「{lane}」──", C.BOLD))
         info(f"      版本      : {plan['version']}")
-        if plan["is_primary"]:
-            info("")
-            warn("★ 这是你的【主要版本】—— 你日常真正在用的那一套。")
-            warn("  删除后这里的会话记录 / 设置 / 插件组合会一并消失，无法恢复。")
-            info("")
+        if plan["profiles"]:
+            info(col(f"      profiles  : {'、'.join(plan['profiles'])}（随 HOME 一起消失）", C.GRAY))
         info("  将被删除：")
-        info(f"    · 登记信息    lane「{lane}」" + ("（含主要版本标记）" if plan["is_primary"] else ""))
-        if plan["run"].is_file():
-            info(f"    · 运行态      {plan['run']}")
-        if plan["log"].is_file():
-            info(f"    · 启动日志    {plan['log']}")
-        if del_install:
-            info(f"    · 安装树      {plan['install']}　({human_size(plan['install_size'])})")
-        if del_home:
-            info(f"    · DSH_HOME    {plan['home']}　({human_size(plan['home_size'])})")
+        info(f"    · 登记信息    lane「{lane}」")
+        for run_file_path in plan["runs"]:
+            if Path(run_file_path).is_file():
+                info(f"    · 运行态      {run_file_path}")
+        for log_path in plan["logs"]:
+            if Path(log_path).is_file():
+                info(f"    · 启动日志    {log_path}")
+    if del_install:
+        info(f"    · 安装树      {plan['install']}　({human_size(plan['install_size'])})")
+        if plan["profiles"]:
+            info(col(f"                  （含全部 profile 目录，插件组合无法找回）", C.GRAY))
+    if del_home:
+        info(f"    · DSH_HOME    {plan['home']}　({human_size(plan['home_size'])})")
+        info(col("                  （会话记录、设置、凭据一并消失，无法恢复）", C.GRAY))
         info("  将被保留：")
         if not del_install:
             why = (
@@ -5954,7 +6776,7 @@ def cmd_delete(cfg: dict, args) -> int:
             removed.append(f"DSH_HOME  {plan['home']}　({human_size(plan['home_size'])})")
         except Exception as exc:  # noqa: BLE001
             fail(f"删 DSH_HOME 失败（{plan['home']}）：{exc}")
-    for f in (plan["run"], plan["log"]):
+    for f in plan["runs"] + plan["logs"]:
         try:
             if Path(f).is_file():
                 Path(f).unlink()
@@ -5963,9 +6785,6 @@ def cmd_delete(cfg: dict, args) -> int:
 
     cfg = load_config()
     cfg.get("lanes", {}).pop(lane, None)
-    was_primary = str(cfg.get("primary") or "") == lane
-    if was_primary:
-        cfg["primary"] = ""
     save_config(cfg)
     clear_run(cfg, lane)
 
@@ -5975,16 +6794,28 @@ def cmd_delete(cfg: dict, args) -> int:
         info(f"      · {item}")
     if not removed:
         info(col("      （只清了登记与运行态，没删任何目录）", C.GRAY))
-    left = ordered_lanes(cfg)
-    if was_primary:
-        warn("主要版本标记已一并清空。")
-    if left and not primary_lane(cfg):
-        info(col(f"  建议重新指定主要版本： py {ME_NAME} primary {left[0][0]}", C.CYAN))
     return 0
 
 
+def lane_log_path(cfg: dict, lane: str, profile: str = DEFAULT_PROFILE) -> Path:
+    """这个 profile 的启动日志。写入一律用新命名 <lane>__<profile>.log；
+    读取时若新文件还没有、而 v0.2 的 <lane>.log 在（web profile），回落到旧文件。"""
+    new = paths(cfg)["logs"] / f"{lane}__{profile}.log"
+    if new.is_file() or profile != DEFAULT_PROFILE:
+        return new
+    legacy = paths(cfg)["logs"] / f"{lane}.log"
+    return legacy if legacy.is_file() else new
+
+
 def cmd_logs(cfg: dict, args) -> int:
-    log = paths(cfg)["logs"] / f"{args.lane}.log"
+    lane_part, sep, prof_part = args.lane.partition("/")
+    profile = (prof_part.strip() if sep else "") or DEFAULT_PROFILE
+    try:
+        validate_profile_name(profile)
+    except ValueError as exc:
+        fail(str(exc))
+        return 1
+    log = lane_log_path(cfg, lane_part, profile)
     if not log.is_file():
         fail(f"没有日志：{log}")
         return 1
@@ -6009,9 +6840,11 @@ def build_parser() -> argparse.ArgumentParser:
             "  py dsh_lanes.py doctor\n"
             "  py dsh_lanes.py versions\n"
             "  py dsh_lanes.py create next 0.1.7-rc.2\n"
-            "  py dsh_lanes.py open next\n"
-            "  py dsh_lanes.py open 0.1.5-rc.3 --port 3082 --detach\n"
-            "  py dsh_lanes.py stop next\n"
+            "  py dsh_lanes.py open next                     # 默认 profile（web），端口自动挑\n"
+            "  py dsh_lanes.py open next/test --port 3082    # 指定 profile 与端口\n"
+            "  py dsh_lanes.py profile-add next clean --from web\n"
+            "  py dsh_lanes.py copy-key global next --only DEEPSEEK_API_KEY\n"
+            "  py dsh_lanes.py stop next                     # 停这条 lane 的全部 profile\n"
         ),
     )
     parser.add_argument("--root", help="覆盖 lane 根目录（也可写进 lanes.json）")
@@ -6026,7 +6859,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_create = sub.add_parser("create", help="安装指定版本并登记为一条 lane")
     p_create.add_argument("lane", help="lane 名，例如 stable / next / last")
     p_create.add_argument("version", help="版本号或 dist-tag，例如 0.1.7-rc.2 / next / latest")
-    p_create.add_argument("--port", type=int, help="指定端口（默认自动挑空闲端口）")
     p_create.add_argument("--force", action="store_true", help="lane 已存在时覆盖其版本")
     p_create.add_argument("--no-follow", dest="follow", action="store_false",
                           help="安装时不实时跟随日志")
@@ -6034,9 +6866,11 @@ def build_parser() -> argparse.ArgumentParser:
                           help="从哪个 npm 源查版本并下载：auto（默认，先官方再镜像）/ "
                                "official / mirror / 一个地址。缺依赖会自动换另一个源重试")
 
-    p_open = sub.add_parser("open", help="打开一条 lane（lane 名或已安装的版本号）")
-    p_open.add_argument("target", help="lane 名或版本号")
-    p_open.add_argument("--port", type=int, help="覆盖端口")
+    p_open = sub.add_parser("open", help="打开一个 profile（lane 名或 lane/profile）")
+    p_open.add_argument("target", help="lane 名、lane/profile 或版本号")
+    p_open.add_argument("--profile", help="要启动的 profile（默认 web；也可写 lane/profile）")
+    p_open.add_argument("--port", type=int,
+                        help="这次启动用的端口（默认实时挑空闲；偏好端口被占用也会自动改口）")
     p_open.add_argument("--cwd", help="覆盖工作区（影响 session 归属）")
     p_open.add_argument("--timeout", type=int, help="启动等待超时秒数")
     p_open.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
@@ -6048,13 +6882,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="端口已有实例时只接管、不打开浏览器",
     )
 
-    sub.add_parser("list", help="列出全部 lane 及其运行状态")
+    sub.add_parser("list", help="列出全部 lane 及其 profile 运行状态")
 
-    p_stop = sub.add_parser("stop", help="停止 lane（默认全部）")
-    p_stop.add_argument("target", nargs="*", help="lane 名，缺省停止全部")
+    p_stop = sub.add_parser("stop", help="停止：缺省全部；lane＝它的全部 profile；lane/profile＝单个")
+    p_stop.add_argument("target", nargs="*", help="lane 名或 lane/profile，缺省停止全部")
 
-    p_logs = sub.add_parser("logs", help="查看某条 lane 的日志")
-    p_logs.add_argument("lane")
+    p_logs = sub.add_parser("logs", help="查看某个 profile 的启动日志")
+    p_logs.add_argument("lane", help="lane 名或 lane/profile")
     p_logs.add_argument("--lines", type=int, default=60, help="显示最后 N 行（默认 60）")
 
     sub.add_parser("instances", help="列出本机所有 DSH 实例（含不是本启动器启动的，如全局安装的 3080）")
@@ -6072,16 +6906,39 @@ def build_parser() -> argparse.ArgumentParser:
     p_remove.add_argument("lane")
     p_remove.add_argument("--force", action="store_true", help="即使正在运行也注销登记")
 
-    p_primary = sub.add_parser(
-        "primary", help="标记/查看主要版本（常用版本）：新建 lane 会继承它的 API key"
+    p_profiles = sub.add_parser(
+        "profiles", help="列出一条 lane 的全部 profile（环境）与各自运行状态"
     )
-    p_primary.add_argument("lane", nargs="?", help="lane 名；缺省则显示当前主要版本")
-    p_primary.add_argument("--clear", action="store_true", help="清除主要版本标记")
+    p_profiles.add_argument("lane")
 
-    p_sync = sub.add_parser(
-        "sync-key", help="把主要版本的 API key 补齐到已有 lane（新建时已自动复制一次）"
+    p_profile_add = sub.add_parser(
+        "profile-add",
+        help="给一条 lane 新建 profile：干净环境（默认）或 --from 复制现有 profile 的插件组合",
     )
-    p_sync.add_argument("lane", nargs="*", help="lane 名；缺省＝全部")
+    p_profile_add.add_argument("lane")
+    p_profile_add.add_argument("name", help="新 profile 名（字母/数字开头，含 . _ -）")
+    p_profile_add.add_argument("--from", dest="from_profile", metavar="现有profile",
+                               help="整目录复制这个现有 profile（含已装插件与补丁层）")
+
+    p_profile_rm = sub.add_parser(
+        "profile-rm", help="移除一个 profile（删它的目录；默认 profile web 不可删）"
+    )
+    p_profile_rm.add_argument("lane")
+    p_profile_rm.add_argument("name")
+    p_profile_rm.add_argument("--yes", action="store_true", help="跳过确认（GUI / 脚本用）")
+
+    p_keys = sub.add_parser(
+        "keys", help="列出一条 lane 的凭据条目（.credentials.yaml refs 段，即各提供商的 key）"
+    )
+    p_keys.add_argument("lane")
+
+    p_copy_key = sub.add_parser(
+        "copy-key", help="在 lane 之间按条目复制 API key：--only 挑条目，缺省全部"
+    )
+    p_copy_key.add_argument("source", help="源 lane 名")
+    p_copy_key.add_argument("dest", help="目标 lane 名")
+    p_copy_key.add_argument("--only", metavar="条目,条目",
+                            help="只复制这些条目（逗号分隔，如 DEEPSEEK_API_KEY）")
 
     p_delete = sub.add_parser(
         "delete", help="彻底删除一套 DSH：登记 + 运行态 + 安装树 + DSH_HOME"
@@ -6126,14 +6983,16 @@ def build_parser() -> argparse.ArgumentParser:
         "verify", help="核对一条 lane 的隔离与内容（clone 之后、升级之后再各跑一次）"
     )
     p_verify.add_argument("lane")
+    p_verify.add_argument("--profile", help="针对哪个 profile 体检（补丁层 / pnpm 账本；默认 web）")
     p_verify.add_argument(
         "--fix", action="store_true", help="按源 lane 重连宿主依赖农场（修复中断/不完整的复制）"
     )
 
     p_plugins = sub.add_parser(
-        "plugins", help="列出某条 lane 的插件开关（插件 → 真实行 id → 关没关、谁能关它）"
+        "plugins", help="列出某个 profile 的插件开关（插件 → 真实行 id → 关没关、谁能关它）"
     )
     p_plugins.add_argument("lane")
+    p_plugins.add_argument("--profile", help="看哪个 profile（默认 web）")
     p_plugins.add_argument("--dump", action="store_true",
                            help="额外离线组合一次，核对「文件说的」与「组合结果」是否一致")
 
@@ -6174,6 +7033,7 @@ def build_parser() -> argparse.ArgumentParser:
         "market", help="插件市场（dshmarket）现状：装的是哪个版本、开还是关、registry 上有没有新版"
     )
     p_market.add_argument("lane")
+    p_market.add_argument("--profile", help="看哪个 profile（默认 web）")
     p_market.add_argument("--offline", action="store_true", help="不查 registry（离线看本地状态）")
 
     p_market_off = sub.add_parser(
@@ -6254,6 +7114,13 @@ def main() -> int:
     cfg = load_config()
     if getattr(args, "root", None):
         cfg["root"] = args.root
+    # 磁盘上有、登记表里没有的 lane（登记表丢过 / 换目录跑过）自动认回来——
+    # 只补登记不动目录；失败不挡任何命令
+    try:
+        for item in adopt_lost_lanes(cfg):
+            info(col(f"自动认领：lane「{item['name']}」（{item['why']}）", C.CYAN))
+    except Exception as exc:  # noqa: BLE001
+        warn(f"自动认领未登记 lane 失败：{type(exc).__name__}: {exc}")
 
     handlers = {
         "doctor": cmd_doctor,
@@ -6266,8 +7133,11 @@ def main() -> int:
         "instances": cmd_instances,
         "adopt": cmd_adopt,
         "remove": cmd_remove,
-        "primary": cmd_primary,
-        "sync-key": cmd_sync_key,
+        "profiles": cmd_profiles,
+        "profile-add": cmd_profile_add,
+        "profile-rm": cmd_profile_rm,
+        "keys": cmd_keys,
+        "copy-key": cmd_copy_key,
         "delete": cmd_delete,
         "clone": cmd_clone,
         "upgrade": cmd_upgrade,
