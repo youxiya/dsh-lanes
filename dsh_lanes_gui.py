@@ -885,6 +885,13 @@ class LauncherApp:
                     self.log(f"自动认领磁盘上的 lane「{item['name']}」（{item['why']}）", "ok")
             except Exception as exc:  # noqa: BLE001
                 self.log(f"[!!] 自动认领未登记 lane 失败：{type(exc).__name__}: {exc}", "warn")
+            # 接管 / 副本 lane 的登记版本对齐到安装树真实版本（本体被 npm 升级后登记会过时）
+            try:
+                for item in core.sync_lane_versions(cfg):
+                    self.log(f"版本对齐：lane「{item['lane']}」{item['from']} → {item['to']}"
+                             "（以安装树为准）", "ok")
+            except Exception as exc:  # noqa: BLE001
+                self.log(f"[!!] 版本对齐失败：{type(exc).__name__}: {exc}", "warn")
         states = core.lane_states(cfg)          # {lane: {profile: 运行态|None}}，复用同一份 TCP 表
         try:
             foreign = core.discover_instances(cfg)

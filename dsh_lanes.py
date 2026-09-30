@@ -1126,6 +1126,33 @@ def all_run_records(cfg: dict) -> list[dict]:
     return out
 
 
+def sync_lane_versions(cfg: dict) -> list[dict]:
+    """把「接管 / 副本」lane 登记的版本对齐到安装树的真实版本。
+
+    为什么只对带 installDir 的 lane 做：这类 lane 的安装树在登记之外（npm 全局 /
+    clones 目录），用户完全可以绕过启动器升级它（`npm i -g` / 手动 npm install）——
+    升级后登记还是旧版本，界面上显示 0.1.7、实际跑的是 0.2。发现不一致就以安装树
+    为准改登记（不动任何文件）。常规 lane 不做这件事：它们的版本号就是安装树的
+    定位器（versions/<版本>），反向同步会让登记指向错误的位置；它们的不一致由
+    require_version_installed 明确报错。
+    """
+    changed: list[dict] = []
+    for lane, data in cfg.get("lanes", {}).items():
+        if not isinstance(data, dict) or not data.get("installDir"):
+            continue
+        install = Path(data["installDir"])
+        if _manifest_name(install) == PKG:
+            actual = _manifest_version(install)          # 接管型：installDir 就是 dsh 包目录
+        else:
+            actual = installed_version(install)          # 副本型：prefix 树
+        if actual and str(actual) != str(data.get("version")):
+            changed.append({"lane": lane, "from": str(data.get("version")), "to": str(actual)})
+            data["version"] = str(actual)
+    if changed:
+        save_config(cfg)
+    return changed
+
+
 def port_claimed_by_other(cfg: dict, lane: str, profile: str, port: int) -> bool:
     """这个端口有没有被**别的** (lane, profile) 的存活实例认领着。
 
@@ -7121,6 +7148,13 @@ def main() -> int:
             info(col(f"自动认领：lane「{item['name']}」（{item['why']}）", C.CYAN))
     except Exception as exc:  # noqa: BLE001
         warn(f"自动认领未登记 lane 失败：{type(exc).__name__}: {exc}")
+    # 接管 / 副本 lane 的登记版本对齐到安装树真实版本（本体被 npm 升级后登记会过时）
+    try:
+        for item in sync_lane_versions(cfg):
+            info(col(f"版本对齐：lane「{item['lane']}」{item['from']} → {item['to']}（以安装树为准）",
+                     C.CYAN))
+    except Exception as exc:  # noqa: BLE001
+        warn(f"版本对齐失败：{type(exc).__name__}: {exc}")
 
     handlers = {
         "doctor": cmd_doctor,
