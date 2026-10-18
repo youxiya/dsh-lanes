@@ -45,6 +45,7 @@ import queue
 import re
 import secrets
 import select
+import shutil
 import socket
 import subprocess
 import sys
@@ -62,7 +63,7 @@ if str(HERE) not in sys.path:
 
 import dsh_lanes as core  # noqa: E402
 
-BUILD = "web-0.6.3"
+BUILD = "web-0.6.4"
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 MAX_LOG_LINES = 4000          # 服务器侧日志环形缓冲（与旧界面 _MAX_LOG_LINES 对齐）
@@ -1027,17 +1028,52 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return self._json({"job": f"加入 lane：{plan['lane']}"})
 
     def _act_open_path(self, body: dict):
+        """在资源管理器里打开一个目录 / 定位一个配置文件（需求③的"打开"按钮）。
+
+        只认**白名单**里的目标：前端传 which（root/home/profile/logs/backups/install），
+        或 which=file + key（补丁层/凭据/package.json…）。任意路径一律拒绝。
+        """
         which = str(body.get("which") or "root")
-        if which != "root":
+        cfg = core.load_config()
+        layout = core.ensure_layout(cfg)
+        profile = str(body.get("profile") or core.DEFAULT_PROFILE).strip() or core.DEFAULT_PROFILE
+        target = None
+        if which == "root":
+            target = layout["root"]
+        elif which == "logs":
+            target = layout["logs"]
+        elif which == "backups":
+            target = layout["backups"]
+        elif which == "file":
+            lane = _need_str(body, "lane")
+            key = _need_str(body, "key")
+            probe = _config_file_path(cfg, lane, profile, key)
+            if probe is None:
+                raise ValueError(f"不认识的配置文件 {key!r}")
+            want = str(body.get("path") or "").strip()
+            if want and Path(want) != probe:
+                raise ValueError("路径不在允许范围内")
+            target = probe
+        elif which in ("home", "profile", "install"):
+            lane = _need_str(body, "lane")
+            home = core.lane_home(cfg, lane)
+            target = {"home": home, "profile": core.profile_dir(home, profile),
+                      "install": core.lane_install_dir(cfg, lane)}[which]
+        else:
             raise ValueError(f"不认识的目录 {which!r}")
-        root = core.ensure_layout(core.load_config())["root"]
         try:
-            os.startfile(str(root))  # type: ignore[attr-defined]
+            target = Path(target)
+            if not target.exists():
+                return self._json({"error": f"还不存在：{target}"}, 404)
+            if target.is_file():
+                subprocess.Popen(["explorer", "/select,", str(target)])
+            else:
+                os.startfile(str(target))  # type: ignore[attr-defined]
         except Exception as exc:  # noqa: BLE001
-            self.app.hub.log(f"[!!] 打不开目录：{exc}", "warn")
-            return self._json({"error": f"打不开目录：{exc}"}, 500)
-        self.app.hub.log(f"已打开根目录 {root}", "muted")
-        return self._json({"ok": True, "root": str(root)})
+            self.app.hub.log(f"[!!] 打不开 {target}：{exc}", "warn")
+            return self._json({"error": f"打不开：{exc}"}, 500)
+        self.app.hub.log(f"已打开 {target}", "muted")
+        return self._json({"ok": True, "path": str(target), "dir": str(target.parent)})
 
     def _act_open_url(self, body: dict):
         url = _need_str(body, "url")
@@ -1219,10 +1255,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
         lanes = [n for n, d in (cfg.get("lanes") or {}).items() if isinstance(d, dict)]
         home = str(((cfg.get("lanes") or {}).get(lane) or {}).get("home") or "")
         refs = core.read_credential_refs(home)
-        # **只回键名**：refs 的值就是真正的密钥，界面从来只显示条目名（＝经典界面的做法）
+        # 值（真密钥）不进这里：只有 credential_get 才取明文。这里给条目名 +
+        # 谁在用它（dsh 里的 displayName），让面板能看出"这条是干嘛的"。
+        try:
+            sources = core.lane_credential_sources(cfg, lane)
+        except Exception:  # noqa: BLE001
+            sources = {}
+        items = []
+        for name in sorted(refs):
+            users = sources.get(name) or []
+            items.append({
+                "name": name,
+                "display": next((u.get("displayName") for u in users
+                                 if u.get("displayName")), "") or name,
+                "providers": [u.get("displayName") or u.get("route") or u.get("profile")
+                              for u in users],
+            })
         return self._json({
             "lane": lane, "lanes": lanes,
             "path": str(core.credentials_path(home)),
+            "items": items,
             "keys": sorted(refs),
         })
 
@@ -1235,11 +1287,147 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if isinstance(only, list):
             only = ",".join(str(x).strip() for x in only if str(x).strip())
         only = str(only or "").strip()
-        if not only:
+        all_entries = only in ("__all__", "*")
+        if not only and not all_entries:
             raise ValueError("至少勾选一个条目（或换一个源）")
+        if all_entries:
+            only = ""            # 空 = CLI 的「不写 --only」＝整份复制
         args = argparse.Namespace(source=source, dest=dest, only=only)
         return self._start(f"复制凭据 {source} → {dest}",
                            lambda: core.cmd_copy_key(core.load_config(), args))
+
+    # ④b 凭据条目读值 / 改值 / 删条目 / 重新导入（需求②：可视化面板，值点了才加载）──
+    def _act_credential_get(self, body: dict):
+        """取一个条目的**明文值**（面板上点「显示/编辑」时才调它，回环本机）。"""
+        lane = _need_str(body, "lane")
+        name = _need_str(body, "name")
+        cfg = core.load_config()
+        if lane not in (cfg.get("lanes") or {}):
+            raise ValueError(f"没有 lane「{lane}」")
+        value = core.credential_ref_value(core.lane_home(cfg, lane), name)
+        if value is None:
+            return self._json({"ok": False, "error": f"条目「{name}」不存在"})
+        return self._json({"ok": True, "lane": lane, "name": name, "value": value})
+
+    def _act_credential_set(self, body: dict):
+        """改/加一个条目（写后宿主校验，不过自动回滚）。"""
+        lane = _need_str(body, "lane")
+        name = _need_str(body, "name")
+        if not core.CRED_KEY_RE.match(name):
+            raise ValueError("条目名只能用字母/数字/_.-（大写习惯，如 MY_API_KEY）")
+        if "value" not in body:
+            raise ValueError("缺少参数 value")
+        cfg = core.load_config()
+        if lane not in (cfg.get("lanes") or {}):
+            raise ValueError(f"没有 lane「{lane}」")
+        res = core.set_credential_refs(cfg, lane, {name: str(body.get("value") or "")}, verify=True)
+        return self._json(_jsonable(res))
+
+    def _act_credential_del(self, body: dict):
+        lane = _need_str(body, "lane")
+        names = body.get("names")
+        if names is None:
+            names = [body.get("name")] if body.get("name") else []
+        if not isinstance(names, list):
+            raise ValueError("names 必须是数组")
+        names = [str(n).strip() for n in names if str(n).strip()]
+        if not names:
+            raise ValueError("没有指定要删的条目")
+        cfg = core.load_config()
+        if lane not in (cfg.get("lanes") or {}):
+            raise ValueError(f"没有 lane「{lane}」")
+        res = core.delete_credential_refs(cfg, lane, names, verify=True)
+        return self._json(_jsonable(res))
+
+    def _act_credential_import(self, body: dict):
+        """从别的 lane 重新导入条目（修坏掉的文件就是走这条：整段重铺 refs）。"""
+        lane = _need_str(body, "lane")
+        source = _need_str(body, "source")
+        if source == lane:
+            raise ValueError("源和目标是同一条 lane")
+        only = body.get("only")
+        rebuild = bool(body.get("rebuild", True))
+        cfg = core.load_config()
+        for name in (lane, source):
+            if name not in (cfg.get("lanes") or {}):
+                raise ValueError(f"没有 lane「{name}」")
+        refs = core.read_credential_refs(core.lane_home(cfg, source))
+        if isinstance(only, list) and only:
+            keep = {str(x).strip() for x in only if str(x).strip()}
+            refs = {k: v for k, v in refs.items() if k in keep}
+        if not refs:
+            raise ValueError(f"lane「{source}」没有可导入的条目")
+        # 目标里读得出来、源里没有的条目会被保留（可能是别的插件在用的 key）
+        before = core.read_credential_refs(core.lane_home(cfg, lane))
+        res = core.set_credential_refs(cfg, lane, refs, verify=True, rebuild=rebuild)
+        res["imported"] = sorted(refs)
+        res["source"] = source
+        res["kept"] = sorted(k for k in before if k not in refs)
+        return self._json(_jsonable(res))
+
+    # ④c 自定义服务商（llm-pi-ai providers）：列出 / 新增（需求②的后半）─────────
+    def _act_provider_list(self, body: dict):
+        lane = _need_str(body, "lane")
+        profile = str(body.get("profile") or core.DEFAULT_PROFILE).strip() or core.DEFAULT_PROFILE
+        cfg = core.load_config()
+        if lane not in (cfg.get("lanes") or {}):
+            raise ValueError(f"没有 lane「{lane}」")
+        view = core.lane_profiles_view(cfg, lane)
+        try:
+            providers = _jsonable(core.lane_custom_providers(cfg, lane, profile))
+            error = ""
+        except Exception as exc:  # noqa: BLE001
+            providers, error = [], f"{type(exc).__name__}: {exc}"
+        return self._json({
+            "ok": True, "lane": lane, "profile": profile, "providers": providers, "error": error,
+            "profiles": [{"name": name, "onDisk": bool(v.get("onDisk"))}
+                         for name, v in sorted(view.items())],
+            "apis": list(core.PROVIDER_APIS),
+        })
+
+    def _act_provider_add(self, body: dict):
+        lane = _need_str(body, "lane")
+        profile = str(body.get("profile") or core.DEFAULT_PROFILE).strip() or core.DEFAULT_PROFILE
+        route = _need_str(body, "route")
+        api = _need_str(body, "api")
+        base_url = str(body.get("baseURL") or "").strip()
+        display = str(body.get("displayName") or "").strip()
+        api_key = str(body.get("apiKey") or "")
+        models = _provider_models(body.get("models"))
+        cfg = core.load_config()
+        res = core.write_custom_provider(cfg, lane, profile, route, api, base_url, models,
+                                         display_name=display, api_key=api_key,
+                                         overwrite=bool(body.get("overwrite")), verify=True)
+        return self._json(_jsonable(res))
+
+    # ④d 配置文件查看（需求③：按键打开各 dsh 配置文件，这里给出内容 + 所在目录）──
+    def _act_file_view(self, body: dict):
+        lane = _need_str(body, "lane")
+        which = _need_str(body, "which")
+        profile = str(body.get("profile") or core.DEFAULT_PROFILE).strip() or core.DEFAULT_PROFILE
+        cfg = core.load_config()
+        path = _config_file_path(cfg, lane, profile, which)
+        if path is None:
+            raise ValueError(f"不认识的配置文件 {which!r}")
+        if not path.is_file():
+            return self._json({"ok": False, "which": which, "path": str(path),
+                               "error": "文件还不存在（这条 lane/profile 可能还没启动过）"})
+        try:
+            text = path.read_text(encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            return self._json({"ok": False, "which": which, "path": str(path),
+                               "error": f"读不出来：{type(exc).__name__}: {exc}"})
+        size = path.stat().st_size
+        clipped = False
+        if len(text) > 400_000:
+            text = text[:400_000]
+            clipped = True
+        return self._json({
+            "ok": True, "lane": lane, "profile": profile, "which": which,
+            "path": str(path), "dir": str(path.parent), "text": text,
+            "bytes": size, "clipped": clipped,
+            "yaml": which in ("patch", "credentials", "pnpm-workspace"),
+        })
 
     # ④ 插件库：读取已装插件 + 跨 profile / 跨版本搬运 ────────────────────────
     def _act_plugin_list(self, body: dict):
@@ -1302,6 +1490,53 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     core.info(core.col(f"      {item['pkg']}  {item['version'] or '?'}"
                                        f"  [{item['kind']}]", core.C.GRAY))
         return self._start("插件总览", job)
+
+    # ④e 单插件开关 / 加装 / 卸载（需求②：启动器页面直接管各 profile 的插件）──────
+    def _act_plugin_state(self, body: dict):
+        """打开/关掉一个插件（写补丁层，写后宿主校验，不过自动回滚）。"""
+        lane = _need_str(body, "lane")
+        profile = str(body.get("profile") or core.DEFAULT_PROFILE).strip() or core.DEFAULT_PROFILE
+        pkg = _need_str(body, "pkg")
+        on = bool(body.get("on"))
+        cfg = core.load_config()
+        if lane not in (cfg.get("lanes") or {}):
+            raise ValueError(f"没有 lane「{lane}」")
+        view = core.lane_profiles_view(cfg, lane)
+        if profile not in view or not view[profile].get("onDisk"):
+            raise ValueError(f"profile「{profile}」在磁盘上不存在")
+        res = core.apply_plugin_states(cfg, lane, [(pkg, on)], profile=profile,
+                                       force=bool(body.get("force")))
+        return self._json(_jsonable(res))
+
+    def _act_plugin_add(self, body: dict):
+        lane = _need_str(body, "lane")
+        profile = str(body.get("profile") or core.DEFAULT_PROFILE).strip() or core.DEFAULT_PROFILE
+        spec = str(body.get("spec") or "").strip()
+        if not spec:
+            raise ValueError("没写要装什么（包名，可带版本）")
+        def job() -> None:
+            res = core.add_plugin(core.load_config(), lane, profile, spec,
+                                  timeout=int(body.get("timeout") or 1800))
+            if res["ok"]:
+                core.ok(f"  √ {res['pkg']} {res['version'] or ''}（{res['mode'] or '?'}）已装好"
+                        + ("，已登记进 dsh.profile.bundles" if res["bundles"] else ""))
+            else:
+                core.fail(f"  加装失败：{res['error']}")
+        return self._start(f"加装插件 → {lane}/{profile}", job)
+
+    def _act_plugin_remove(self, body: dict):
+        lane = _need_str(body, "lane")
+        profile = str(body.get("profile") or core.DEFAULT_PROFILE).strip() or core.DEFAULT_PROFILE
+        pkg = _need_str(body, "pkg")
+        clean = bool(body.get("cleanRows"))
+        def job() -> None:
+            res = core.remove_plugin(core.load_config(), lane, profile, pkg,
+                                     clean_rows=clean)
+            if res["ok"]:
+                core.ok(f"  √ {pkg} 已卸载" + ("（顺带清了补丁行）" if res["rows_cleaned"] else ""))
+            else:
+                core.fail(f"  卸载失败：{res['error']}")
+        return self._start(f"卸载插件 {pkg} ← {lane}/{profile}", job)
 
     # ⑤ 插件市场（dshmarket）单独开关 / 更新 ─────────────────────────────────
     def _act_market_get(self, body: dict):
@@ -1779,10 +2014,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         "profile_add": _act_profile_add,
         "credentials": _act_credentials,
         "copy_key": _act_copy_key,
+        "credential_get": _act_credential_get,
+        "credential_set": _act_credential_set,
+        "credential_del": _act_credential_del,
+        "credential_import": _act_credential_import,
+        "provider_list": _act_provider_list,
+        "provider_add": _act_provider_add,
+        "file_view": _act_file_view,
         "plugin_list": _act_plugin_list,
         "plugin_plan": _act_plugin_plan,
         "plugin_transfer": _act_plugin_transfer,
         "plugin_overview": _act_plugin_overview,
+        "plugin_state": _act_plugin_state,
+        "plugin_add": _act_plugin_add,
+        "plugin_remove": _act_plugin_remove,
         "market_get": _act_market_get,
         "market_off": _act_market_off,
         "market_on": _act_market_on,
@@ -1832,6 +2077,57 @@ def _need_profiles(body: dict) -> list[str] | None:
     if not isinstance(raw, list):
         raise ValueError("profiles 必须是数组（或逗号分隔的字符串）")
     return [str(part).strip() for part in raw if str(part).strip()]
+
+
+# 配置文件查看（需求③）：按钮上给的 which → 实际文件。全部**限死在这几个**里，
+# 前端不能传任意路径（那等于给了一个"随便读一个文件"的接口）。
+_CONFIG_FILES = {
+    "patch": lambda cfg, lane, prof, home: core.plugin_patch_path(cfg, lane, prof),
+    "credentials": lambda cfg, lane, prof, home: core.credentials_path(home),
+    "package": lambda cfg, lane, prof, home: core.profile_dir(home, prof) / "package.json",
+    "lock": lambda cfg, lane, prof, home: core.profile_dir(home, prof) / "pnpm-lock.yaml",
+    "workspace": lambda cfg, lane, prof, home: core.profile_dir(home, prof) / "pnpm-workspace.yaml",
+    "modules": lambda cfg, lane, prof, home: core.profile_dir(home, prof) / "node_modules" / ".modules.yaml",
+}
+
+
+def _config_file_path(cfg: dict, lane: str, profile: str, which: str) -> Path | None:
+    if lane not in (cfg.get("lanes") or {}):
+        raise ValueError(f"没有 lane「{lane}」")
+    fn = _CONFIG_FILES.get(which)
+    if fn is None:
+        return None
+    home = core.lane_home(cfg, lane)
+    return fn(cfg, lane, profile, home)
+
+
+def _provider_models(raw) -> list[dict]:
+    """前端的模型清单（字符串或对象）→ dsh 认的 models 数组。"""
+    models: list[dict] = []
+    for item in raw or []:
+        if isinstance(item, str):
+            if item.strip():
+                models.append({"id": item.strip()})
+            continue
+        if not isinstance(item, dict):
+            continue
+        mid = str(item.get("id") or "").strip()
+        if not mid:
+            continue
+        entry: dict = {"id": mid}
+        name = str(item.get("name") or "").strip()
+        if name and name != mid:
+            entry["name"] = name
+        for key in ("contextWindow", "maxTokens"):
+            value = item.get(key)
+            if value in (None, ""):
+                continue
+            try:
+                entry[key] = int(value)
+            except (TypeError, ValueError):
+                continue
+        models.append(entry)
+    return models
 
 
 def _jsonable(obj):
@@ -2034,6 +2330,23 @@ def run_classic(rest: list[str]) -> int:
     return 1
 
 
+def find_js_yaml_seed(cfg: dict) -> str:
+    """找一份现成的 js-yaml（本机 npm 全局装的 dsh 里那份）→ 路径；找不到返回空串。
+
+    自检环境是临时 root，没有宿主包，宿主判据会退成 skip；把它拷进临时 HOME，
+    判据就能**按真实规则**跑起来（而不是永远"跳过"）。
+    """
+    candidates = [
+        Path(str(os.environ.get("APPDATA") or "")) / "npm" / "node_modules"
+        / "@deepseek-ai" / "dsh" / "node_modules" / "js-yaml",
+    ]
+    real_root = str(cfg.get("root") or "")
+    if real_root:
+        candidates += sorted(Path(real_root).glob("node_modules/js-yaml"))
+    src = next((c for c in candidates if (c / "package.json").is_file()), None)
+    return str(src) if src else ""
+
+
 def selfcheck() -> int:
     """服务器自检：**只用临时配置**，绝不碰你真实的 lanes.json。
 
@@ -2054,6 +2367,20 @@ def selfcheck() -> int:
     cfg["ui"] = {"w": 1200, "h": 780, "x": 10, "y": 20, "theme": "light"}
     core.save_config(cfg)
     core.ensure_layout(cfg)      # 临时根目录下把 versions/homes/clones/logs 建出来，贴近真实环境
+    js_yaml_src = find_js_yaml_seed(cfg)
+
+    def ensure_judge(lane: str) -> bool:
+        """把一份真 js-yaml 拷进这条 lane 的临时 HOME，让宿主判据真跑（没有就返回 False）。"""
+        if not js_yaml_src:
+            return False
+        home = core.lane_home(core.load_config(), lane)
+        dest = Path(home) / "profiles" / "node_modules" / "js-yaml"
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(js_yaml_src, dest, dirs_exist_ok=True)
+        except OSError:
+            return False
+        return True
 
     app = Launcher(secrets.token_hex(16), stay=True)
     httpd = make_server("127.0.0.1", 0, app)
@@ -2246,8 +2573,152 @@ def selfcheck() -> int:
         blob = json.dumps(body, ensure_ascii=False)
         check("credentials 列出条目名",
               status == 200 and body.get("keys") == ["DEEPSEEK_API_KEY"], blob[:160])
-        # 这条是安全断言：refs 的**值**就是真密钥，界面从来只显示条目名
+        # 这条是安全断言：refs 的**值**就是真密钥，列表接口从来只回条目名（值点了才单独取）
         check("credentials 不回密钥值", "sk-selfcheck-not-a-real-key" not in blob, blob[:200])
+
+        # ⑫b 凭据条目 读值 / 改值 / 删 / 重新导入（需求②）
+        status, body = call("POST", "/api/credential_get",
+                            {"lane": tmp_lane, "name": "DEEPSEEK_API_KEY"})
+        check("credential_get 点了才回明文值",
+              status == 200 and body.get("value") == "sk-selfcheck-not-a-real-key",
+              str(body)[:140])
+
+        status, body = call("POST", "/api/credential_set",
+                            {"lane": tmp_lane, "name": "MY_TEST_KEY", "value": "v-1"})
+        check("credential_set 写入成功且校验通过",
+              status == 200 and body.get("ok") is True and body.get("verify") in ("ok", "skip"),
+              str(body)[:200])
+        status, body = call("POST", "/api/credential_get",
+                            {"lane": tmp_lane, "name": "MY_TEST_KEY"})
+        check("credential_set 之后能读回来", body.get("value") == "v-1", str(body)[:140])
+        status, body = call("POST", "/api/credential_del",
+                            {"lane": tmp_lane, "names": ["MY_TEST_KEY"]})
+        check("credential_del 删掉条目",
+              status == 200 and body.get("ok") is True and body.get("removed") == ["MY_TEST_KEY"],
+              str(body)[:200])
+        status, body = call("POST", "/api/credential_get",
+                            {"lane": tmp_lane, "name": "MY_TEST_KEY"})
+        check("删掉的条目读不到（ok=False）", status == 200 and body.get("ok") is False,
+              str(body)[:140])
+
+        # 第二条 lane：从它把条目导入 t1
+        home2 = tmp / "root" / "homes" / "t2"
+        (home2 / "profiles" / "web").mkdir(parents=True, exist_ok=True)
+        (home2 / "profiles" / "web" / "package.json").write_text(
+            '{"name": "profile-web", "dependencies": {}}', encoding="utf-8")
+        (home2 / ".credentials.yaml").write_text(
+            "version: 1\nrefs:\n  IMPORTED_KEY: sk-imported\n", encoding="utf-8")
+        cfg3 = json.loads((tmp / "lanes.json").read_text(encoding="utf-8"))
+        cfg3.setdefault("lanes", {})["t2"] = {
+            "version": "0.1.7-rc.2", "home": str(home2), "createdAt": "2026-10-17"}
+        (tmp / "lanes.json").write_text(json.dumps(cfg3, ensure_ascii=False, indent=2),
+                                        encoding="utf-8")
+        status, body = call("POST", "/api/credential_import",
+                            {"lane": tmp_lane, "source": "t2"})
+        check("credential_import 从别的 lane 导入条目",
+              status == 200 and body.get("ok") is True and body.get("imported") == ["IMPORTED_KEY"],
+              str(body)[:200])
+
+        # ⑫b2 坏文件修复：未闭合引号的多行值（就是用户踩到的 MISSING_CHAR）；
+        # 普通写入会被拦住，import（整段重铺）必须能修好它
+        have_judge = ensure_judge(tmp_lane)
+        cred_path = tmp / "root" / "homes" / tmp_lane / ".credentials.yaml"
+        cred_path.write_text(
+            "version: 1\n"
+            "records:\n"
+            "  client-connection/browser-session:\n"
+            "    kind: grant\n"
+            "refs:\n"
+            "  BROKEN_KEY: '{\"access_key_id\":\"AAA\",\n"
+            "    \"secret\":\"BBB\"\n"
+            "  DEEPSEEK_API_KEY: sk-broken\n",
+            encoding="utf-8")
+        status, body = call("POST", "/api/credential_set",
+                            {"lane": tmp_lane, "name": "ANOTHER_KEY", "value": "v-9"})
+        check("坏凭据文件上普通写入被拦住（先别往里写）",
+              status == 200 and body.get("ok") is False and "解析不过" in str(body.get("error")),
+              ("跳过（自检环境没有宿主 js-yaml）" if not have_judge else str(body)[:200]))
+        status, body = call("POST", "/api/credential_import",
+                            {"lane": tmp_lane, "source": "t2"})
+        check("credential_import 整段重铺修好坏文件",
+              status == 200 and body.get("ok") is True and body.get("rebuilt") is True
+              and body.get("verify") in ("ok", "skip"), str(body)[:240])
+        cred = core.load_config()
+        verdict, why = core.judge_yaml_file(cred, tmp_lane, cred_path)
+        check("修好之后宿主解析器判 ok",
+              verdict == ("ok" if have_judge else "skip"), f"{verdict} {why}"[:160])
+        refs_after = core.read_credential_refs(str(tmp / "root" / "homes" / tmp_lane))
+        check("修好后导入的条目在、records 段还在",
+              refs_after.get("IMPORTED_KEY") == "sk-imported"
+              and "records:" in cred_path.read_text(encoding="utf-8"),
+              str(list(refs_after))[:200])
+
+        # ⑫c 自定义服务商：列出 / 新增（需求②的后半）
+        status, body = call("POST", "/api/provider_list", {"lane": tmp_lane, "profile": "web"})
+        check("provider_list 空清单", status == 200 and body.get("providers") == [],
+              str(body)[:160])
+        status, body = call("POST", "/api/provider_add", {
+            "lane": tmp_lane, "profile": "web", "route": "selfcheck-gw",
+            "api": "openai-completions", "baseURL": "https://api.selfcheck.example/v1",
+            "displayName": "自检网关", "apiKey": "sk-selfcheck-provider",
+            "models": [{"id": "m-1", "name": "M One", "contextWindow": 1000}, "m-2"],
+        })
+        check("provider_add 写补丁层 + 密钥",
+              status == 200 and body.get("ok") is True and body.get("keyRef") == "SELFCHECK_GW_API_KEY",
+              str(body)[:240])
+        status, body = call("POST", "/api/provider_list", {"lane": tmp_lane, "profile": "web"})
+        routes = [p.get("route") for p in body.get("providers", [])]
+        check("provider_list 能读回刚写的服务商", routes == ["selfcheck-gw"], str(body)[:200])
+        status, body = call("POST", "/api/provider_add", {
+            "lane": tmp_lane, "profile": "web", "route": "Bad Route",
+            "api": "openai-completions", "baseURL": "https://x/v1", "models": ["m"]})
+        check("provider_add 拒绝非法 route", status == 200 and body.get("ok") is False,
+              str(body)[:160])
+        # 覆盖开关：默认不覆盖（怕把调好的东西冲掉），明确带上 overwrite 才替换
+        overwrite_payload = {
+            "lane": tmp_lane, "profile": "web", "route": "selfcheck-gw",
+            "api": "openai-completions", "baseURL": "https://api.selfcheck.example/v2",
+            "displayName": "自检网关", "models": ["m-3"]}
+        status, body = call("POST", "/api/provider_add", dict(overwrite_payload))
+        check("provider_add 同名且没选覆盖 → 拒绝",
+              status == 200 and body.get("ok") is False and body.get("action") == "refused",
+              str(body)[:200])
+        status, body = call("POST", "/api/provider_add",
+                            dict(overwrite_payload, overwrite=True))
+        check("provider_add overwrite=True → replaced",
+              status == 200 and body.get("ok") is True and body.get("action") == "replaced",
+              str(body)[:200])
+        status, body = call("POST", "/api/provider_list", {"lane": tmp_lane, "profile": "web"})
+        got = body.get("providers", [{}])[0]
+        check("provider_list 覆盖后是新内容",
+              got.get("baseURL") == "https://api.selfcheck.example/v2"
+              and got.get("models") == ["m-3"], str(body)[:200])
+
+        # 凭据列表要带 dsh 里的显示名（面板上「这条是干嘛的」靠它）
+        status, body = call("POST", "/api/credentials", {"lane": tmp_lane})
+        items = {it.get("name"): it for it in body.get("items", [])}
+        check("credentials 回条目 + dsh 显示名",
+              status == 200 and "SELFCHECK_GW_API_KEY" in items
+              and items["SELFCHECK_GW_API_KEY"].get("display") == "自检网关",
+              str(body)[:240])
+
+        # ⑫d 配置文件查看（需求③）
+        for key in ("credentials", "patch", "package"):
+            status, body = call("POST", "/api/file_view",
+                                {"lane": tmp_lane, "profile": "web", "which": key})
+            check(f"file_view 给出 {key} 内容",
+                  status == 200 and body.get("ok") is True and isinstance(body.get("text"), str),
+                  str(body)[:160])
+        status, body = call("POST", "/api/file_view",
+                            {"lane": tmp_lane, "profile": "web", "which": "nope"})
+        check("file_view 未知文件 → 400", status == 400, f"HTTP {status}")
+
+        # ⑫e 插件开关：没这个包时按"跳过"如实报告，不瞎写
+        status, body = call("POST", "/api/plugin_state",
+                            {"lane": tmp_lane, "profile": "web", "pkg": "no-such-pkg", "on": False})
+        check("plugin_state 对不存在的插件如实跳过",
+              status == 200 and body.get("changed") is False and bool(body.get("skipped")),
+              str(body)[:200])
 
         status, body = call("POST", "/api/chat_list", {"lane": tmp_lane})
         check("chat_list 空备份 + 会话数",
@@ -2450,7 +2921,6 @@ def selfcheck() -> int:
         httpd.shutdown()
         httpd.server_close()
         core.CONFIG_PATH = real_config
-        import shutil
         shutil.rmtree(tmp, ignore_errors=True)
 
     print()

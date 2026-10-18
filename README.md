@@ -27,7 +27,8 @@
 | **看见"别的"实例** | `instances` | 列出**不是本启动器启动的** DSH 实例 + 本机所有安装树（npm 全局 / npx 缓存 / versions / clones 里没登记的） |
 | **找回丢登记的 lane** | （自动） | 登记表丢过 / 换目录跑过，磁盘上成对出现的 homes+clones、以及日志里有线索的 homes 会自动重新登记；孤儿的安装树列在「本机各套安装」等手动认领 |
 | **接管在用的那套** | `adopt <lane>` | 把本机已有的安装注册成 lane，沿用它的 `DSH_HOME`；HOME 里现成的 profiles 会一并显示 |
-| **复制 API key（按条目）** | `keys` / `copy-key` | 源 HOME 凭据里的**提供商条目**逐条列出，勾选哪几条复制到哪个 lane，自己说了算 |
+| **凭据（看 / 改 / 增删）** | `keys` / `set-key` / `rm-key` / `copy-key` | 列出每个 HOME 凭据里的**条目**，带上 dsh 里显示的**服务商名字**；点了才取明文值，可改 / 删 / 新增；复制可以整份搬或只挑几条 |
+| **自定义服务商（写入）** | `provider-list` / `provider-add` | 直接在启动器里加 / 改 dsh「设置 → 模型」里的自定义服务商（写 profile 补丁层的 `llm-pi-ai`，顺手把 key 存进凭据）|
 | **复制一整套** | `clone <源> <新>` | 安装树 + `DSH_HOME`（会话、设置、凭据、已装插件）整套复制成副本；`--profiles` 可以只带其中几个环境 |
 | **升到指定版本** | `upgrade <lane> <版本>` | 就地升级 + 核对 + 启动冒烟，起不来自动退回；`--rollback` 回上一版 |
 | 核对隔离 | `verify <lane>` | 逐条比对链接、版本、pnpm 账本、本地依赖，并体检 profile 补丁层 |
@@ -40,7 +41,7 @@ lane 内部的多环境靠 **profile**（见第 4 节）。
 
 > v0.3 起移除了「主要版本（primary）」：不再有"新建 lane 自动继承它的 API key"，
 > 取而代之的是 `keys` / `copy-key`（和界面上的「凭据…」）——**哪些提供商条目复制到哪个
-> 环境，由你勾选决定**。
+> 环境，由你说了算**。
 
 ---
 
@@ -64,7 +65,7 @@ lane 内部的多环境靠 **profile**（见第 4 节）。
 3. 卡片上是这条 lane 的 **profiles 列表**：每个环境一行，端口框**留空＝启动时自动挑空闲端口**，
    也可以现场填一个（被占用会自动改口）。点「打开」就起一个带 token 地址的 DSH web。
 4. 「**＋ 添加 Profile…**」可以给同一个版本开新环境：干净环境，或整目录复制现有 profile（含已装插件）。
-5. 「停止」「日志」「凭据…」「升级版本…」「复制…」「插件…」「插件市场…」「备份对话…」「删除这套 DSH」都在卡片上，
+5. 「停止」「日志」「凭据…」「服务商…」「升级版本…」「复制…」「插件…」「插件市场…」「配置文件…」「备份对话…」「删除这套 DSH」都在卡片上，
    右上角还有「插件库」（全局入口）。**每一个都是先算清"会发生什么"摆给你看，确认了才动手。**
 
 > 两套界面（新版 Web / `start_classic.bat` 的经典界面）功能已经对齐，读写同一份配置，随时可以换着用。
@@ -145,10 +146,15 @@ exe 没签名，首次运行 Windows SmartScreen 可能拦一下：点「更多�
 - lane 的安装树（创建 / 升级 / 复制 / 删除）
 - lane 的 `DSH_HOME`（复制的 API key、对话恢复、运行态文件 `<root>\run\<lane>__<profile>.json`、
   备份目录 `<root>\backups\`、`profile-add` 新建的 profile 目录）
-- 「插件市场」单独开关（`market-off` / `market-on`）会往对应 profile 的补丁层里写一段**带起止标记**的块，用 `market-on` 可整段撤销——其它插件一个都不碰
+- profile 的**补丁层**（`cordis.patch.yml`）：插件开关（写真实行 id）、自定义服务商
+  （`llm-pi-ai`）、插件加装 / 卸载时的清单登记、「插件市场」单独开关（`market-off` / `market-on`
+  写的是一个**带起止标记**的块，`market-on` 可整段撤销）——每次写前留 `.bak`，写后用
+  **dsh 自己的解析器**校验一次，不过就自动回滚
+- 凭据文件 `.credentials.yaml` 的 `refs` 段（改 / 加 / 删条目、从别的 lane 导入）；
+  只动点名的那几行，同样先备份、写后校验、不过回滚
 
-**它不做的事**：不碰 dsh 自己的源代码；不做通用插件开关（在真实 profile 上写坏过一次，已停用，
-要用插件开关请去 dsh 自己的插件市场页面）；不给"这次升级安不安全"的判断结论。
+**它不做的事**：不碰 dsh 自己的源代码；不替你做"这次升级安不安全"的判断；
+不写任何不在上面清单里的文件（界面上「打开配置文件」只是只读预览 + `explorer` 定位）。
 
 > 顺带一个行为保证：**写运行态失败不会让界面崩**。`<root>\run\<lane>.json` 只是"记住上次是谁起的"，
 > 写不进去（目录只读、盘符被限制等）时只在日志里警告一次，卡片改用现场探测显示状态——
@@ -172,9 +178,21 @@ py dsh_lanes.py profiles <lane>           列出这条 lane 的全部 profile（
 py dsh_lanes.py profile-add <lane> <名> [--from 现有profile]
                                           干净环境（默认）或整目录复制现有 profile
 py dsh_lanes.py profile-rm <lane> <名>    移除一个 profile（web 不可删）
-py dsh_lanes.py keys <lane>               列出凭据条目（各提供商的 key 引用）
+py dsh_lanes.py keys <lane>               列出凭据条目（带服务商显示名 / 谁在用它）
+py dsh_lanes.py set-key <lane> <条目> [--value V|--from-env E]
+                                           改 / 加一条凭据；缺 --value 就安全地从 stdin 读
+py dsh_lanes.py rm-key <lane> <条目,条目>  删凭据条目
 py dsh_lanes.py copy-key <源> <目标> [--only 条目,条目]
-                                          按条目复制 API key；缺省全部
+                                           按条目复制 API key；缺省全部
+py dsh_lanes.py provider-list <lane> [--profile web]
+                                           列这个 profile 里手写的自定义服务商
+py dsh_lanes.py provider-add <lane> <route> --api openai-completions --base-url URL
+                                    [--display 名字] [--key sk-...] [--model m1,m2]
+                                    [--profile web] [--overwrite]
+                                           写进补丁层的 llm-pi-ai，key 存进凭据
+py dsh_lanes.py plugin-add <lane> <包名[@版本]> [--profile web]
+py dsh_lanes.py plugin-rm  <lane> <包名> [--profile web] [--clean-rows]
+                                           加装 / 卸载这个 profile 的插件（走 dsh 自己的命令）
 py dsh_lanes.py delete <lane> [--stop] [--keep-home] [--keep-install] [--home-too] [--yes]
 py dsh_lanes.py clone <源 lane> <新 lane> [--profiles web,test] [--port N]
                                           只带这几个 profile（缺省＝源 HOME 里全部）
@@ -342,7 +360,7 @@ build_exe.bat                      :: 双击也行
 | 窗口 | Edge `--app=` + 独立 `--user-data-dir`（`%LOCALAPPDATA%\dsh-lanes\webview-profile`，不动你日常那个浏览器配置） |
 | 退出 | 关窗口 → SSE 断开 → 6s 后进程退出；**绝不顺手停掉正在跑的 DSH** |
 
-**那些表单窗口**（新建版本 / 添加 Profile / 凭据 / 插件库 / 插件市场 / 备份对话 / 复制 / 升级 / 删除）
+**那些表单窗口**（新建版本 / 添加 Profile / 凭据 / 服务商 / 配置文件 / 插件库 / 插件市场 / 备份对话 / 复制 / 升级 / 删除）
 是 `<dialog>` —— 浏览器自带 top layer，所以窗口里再弹一层确认框天然可堆叠，也不用自己写 z-index。
 每个窗口的构成都一样：**只读接口先把"会发生什么"算出来 → 摆给你看 → 你确认了才起后端任务**。
 底部按钮的可用性跟着表单实时重算（例子：删除那一步必须**手打 lane 名**才亮起「删除」；
@@ -366,7 +384,9 @@ build_exe.bat                      :: 双击也行
 **安全**（本地服务该做的都做了）：只监听 `127.0.0.1`；启动生成一次性令牌，首屏 `?token=` 校验后
 下发 `HttpOnly; SameSite=Strict` cookie；校验 `Host` 必须是本机地址（防 DNS rebinding）；
 写操作要求 JSON 类型并校验来源；**不返回任何 CORS 头**；静态文件走白名单、不拼接用户输入做路径；
-「凭据…」只把 `refs` 段的**条目名**送到页面，密钥值从不经过浏览器。
+「凭据…」列表只送**条目名 + dsh 里的显示名**（谁在用它）到页面；**明文密钥只有你点「显示 / 编辑」
+那一下才取**（走独立接口，一次一条，只在本机回环上），平时不进页面、不进日志。
+同理，「服务商…」与「配置文件…」也是按需读、按需定位（`explorer /select,` 打开的那一下才碰文件系统）。
 
 ### 11.2 经典界面（`start_classic.bat` 或 `py dsh_lanes_web.py --classic`）
 
@@ -421,6 +441,12 @@ build_exe.bat                      :: 双击也行
   并核对版本，让你自己判断。
 - 目标里没有的 profile 会自动按官方 web 组合建一个干净环境再搬。
 - 改动前 `package.json` / `cordis.patch.yml` 都会留一份 `.bak`。
+- **两边同版本的自动过滤**：搬一次既费时间，又可能把目标里已经调好的东西（软链、本地改动）
+  盖掉，所以计划里直接标成「自动过滤」并说明理由；源里只有清单登记、其实没装上的也一样过滤。
+
+左边每个插件旁边还有**就地管理**的按钮：**启用 / 禁用**（写它真实的行 id，写后宿主校验、
+不过自动回滚）、**卸载**（`dsh plugin remove` → 摘依赖与 `dsh.profile.bundles` 登记 → 清补丁行）、
+下面一条**加装**（填包名或 `@scope/name@版本`）。官方组合包、宿主基础设施、插件市场一律拒绝动。
 
 命令行：
 
@@ -428,11 +454,52 @@ build_exe.bat                      :: 双击也行
 py dsh_lanes.py plugin-transfer global-copy/web global-copy/web-1 billion-context dsh-ops
 py dsh_lanes.py plugin-transfer global-copy/web global-text/web dsh-ops --mode copy
 py dsh_lanes.py plugin-transfer global-copy/web global-copy/web-1 all --dry-run
+py dsh_lanes.py plugin-off global-copy/web dsh-ops      # 关一个（写真实行 id）
+py dsh_lanes.py plugin-add global-copy/web @liustack/modsearch --profile web
+py dsh_lanes.py plugin-rm  global-copy/web @liustack/modsearch --profile web --clean-rows
 ```
 
 ---
 
-## 13. 配置备份 / 迁移（轻量 zip）
+## 13. 凭据与自定义服务商
+
+### 凭据（`.credentials.yaml` 的 `refs` 段）
+
+一条 HOME 的凭据就是 `refs` 段里的一批「条目名 → 密钥」。界面上「凭据…」不再只是清单：
+
+- 每条**带 dsh 里的显示名**（从 profile 补丁层反查 `displayName` / 插件名），
+  一眼看出「这条是干嘛的」；
+- 点「显示 / 编辑」才取**明文值**（独立接口、一次一条、只在本机回环上），改完保存；
+- 「删除」单条；「新增 / 覆盖」一个条目；「从这条 lane 导入」把别的 lane 整份合并过来
+  （**修坏掉的凭据文件就走这条**）；
+- 一律先备份 `.credentials.yaml.bak`，写后用**宿主自己的解析器**校验，不过自动回滚；
+  文件本来就已经坏的，直接拦住不写。
+
+命令行：`keys <lane> [--show]`（显示名 / 明文）、`set-key <lane> <条目> --value sk-...`
+（或 `--from-env MY_ENV`，别把密钥留在命令行历史里）、`rm-key <lane> <条目,条目>`。
+
+> 为什么以前会把文件写坏：旧实现用**逐行正则**抓条目，多行单引号值（超长 JSON，如
+> `CODEARTS_ACCESS_TOKEN`）只抓到首行，写回时引号没闭合，YAML 直接 `MISSING_CHAR`。
+> 现在按 YAML 标量规则跨行取完整值，并且**只改 `refs` 段里点名的那几行**。
+
+### 自定义服务商（写 dsh「设置 → 模型」的同一处）
+
+dsh 的模型设置页允许手写服务商：route（小写短名）+ 协议 + `baseURL` + 模型清单 + 密钥引用。
+它落在 profile 补丁层的 `llm-pi-ai` → `config.providers.<route>`，密钥本体进 `.credentials.yaml`
+的 `<ROUTE>_API_KEY`。本工具的「服务商…」按**同一套契约**读写它（route 正则、keyRef 命名、
+协议取值都抄 dsh），所以能和那个页面互认：
+
+- 列出这个 profile 已有的手写服务商（显示名 / route / 协议 / baseURL / keyRef / 模型）；
+- 新增或更新一条：默认**拒绝覆盖**同名 route（怕冲掉调好的地址与模型），勾了
+  「允许覆盖已存在的同名 route」才替换；
+- 只填显示名 / 地址不改 key 时，原来的 `apiKeyEnv` 会保留，不会被抹掉。
+
+命令行：`provider-list <lane> [--profile P]`、
+`provider-add <lane> <route> --api openai-completions --base-url URL [--display 名字] [--key sk-...] [--model m1,m2] [--overwrite]`。
+
+---
+
+## 14. 配置备份 / 迁移（轻量 zip）
 
 `clone` 是把**安装树 + HOME 整棵复制**（一套 800MB～1GB，慢）；`chat-backup` 只备份会话。
 配置备份是第三种方式：**只打包"装了什么、说了什么、怎么配置"，不打包插件本体**，
@@ -512,9 +579,20 @@ Web 前端顶部「配置备份」、每张卡片的「配置备份…」；经�
 
 ---
 
-## 14. 更新记录
+## 15. 更新记录
 
-见 [CHANGELOG.md](CHANGELOG.md)。当前版本 **v0.6.3**（2026-10-18）：
+见 [CHANGELOG.md](CHANGELOG.md)。当前版本 **v0.6.4**（2026-10-18）：
+
+- **新**：凭据面板从"只读清单"升级成**能看 / 改 / 删 / 新增 / 重新导入**（列表带 dsh 里的
+  服务商显示名；明文值点了才取，只在本机回环）；新增**自定义服务商**面板与
+  `set-key` / `rm-key` / `provider-list` / `provider-add` 命令。
+- **新**：插件库就地**开关 / 卸载 / 加装**（`plugin-add` / `plugin-rm`）；**配置文件**面板
+  （补丁层 / 凭据 / package.json / lock / workspace / modules 内容 + 一键定位）。
+- **改**：插件迁移自动过滤「两边同版本」的条目（少一次无谓重装，不会覆盖目标里调好的东西）。
+- **修**：凭据写坏 bug —— 多行单引号值以前被逐行正则只取首行、写回时引号未闭合，
+  文件直接解析不过（`MISSING_CHAR`）。现在整套读写按 YAML 标量规则走，写后用宿主解析器
+  校验、不过自动回滚；坏文件会被拦住并提示"从别的 lane 重新导入"。
+- v0.6.3（2026-10-18）：
 
 - **改**：备份/恢复点「开始」后在后台跑、弹窗立即关闭、可回主界面，完成弹结果提示；
   子进程不再弹黑窗（pythonw 静默）；新建 lane 实时显示 npm 下载进度（已下载 N 个包/速率）；
@@ -541,6 +619,6 @@ Web 前端顶部「配置备份」、每张卡片的「配置备份…」；经�
 
 ---
 
-## 15. 许可
+## 16. 许可
 
 MIT，见 [LICENSE](LICENSE)。

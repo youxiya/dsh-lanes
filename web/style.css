@@ -979,6 +979,22 @@ dialog.modal.dlg .modal-foot { flex-wrap: wrap; }
   font-family: Consolas, "Cascadia Mono", ui-monospace, monospace;
 }
 .pick-row .pick-note { font-size: 11px; color: var(--faint); }
+.pick-ops {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  flex-wrap: wrap;
+}
+.grow { flex: 1 1 auto; min-width: 120px; }
+.text-input.grow { width: auto; }
+.file-pre {
+  max-height: 46vh;
+  overflow: auto;
+  white-space: pre;
+  font-size: 11.5px;
+}
 .pick-bar {
   display: flex;
   align-items: center;

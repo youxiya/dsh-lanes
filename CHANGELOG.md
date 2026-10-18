@@ -6,6 +6,64 @@ exe 不进仓库（`.gitignore` 排除了 `dist/`），要分享请把 `dist\*-o
 
 ---
 
+## v0.6.4 — 2026-10-18
+
+需求来自 `list.txt` 四条：插件迁移过滤同版本、启动器页面直接管插件与凭据、按键打开 dsh 配置文件、
+修凭据导入把 YAML 写坏的 bug（顺带把凭据 / 服务商做成可视化面板）。
+
+### 修：凭据文件被写坏（多行单引号值）
+
+症状：导入 / 复制凭据后 `.credentials.yaml` 解析不过 ——
+`invalid document ... MISSING_CHAR at line N, column M`，那套 DSH 直接起不来。
+
+根因：旧的 `_refs_block()` 用**逐行正则**抓条目，多行单引号值（`CODEARTS_ACCESS_TOKEN` 那种
+超长 JSON）只抓到首行；`merge_credential_refs()` 把这一行原样写回，引号没闭合，YAML 就散了。
+
+现在整套读写按 YAML 标量规则走：`_cred_read_lines` / `_cred_open_quote` / `_cred_unescape_double`
+/ `_cred_scalar` 负责**跨行取完整标量**，`_cred_apply_lines` 负责只改 `refs` 段里点名的那几行、
+其它一个字节都不动。写之后用**宿主自己的解析器**校验（`judge_yaml_file`），不过就用 `.bak` 自动回滚；
+文件本来就已经坏掉的，直接拦住不写，并提示"从别的 lane 重新导入"。
+
+### 新：凭据面板（看 / 改 / 删 / 新增 / 重新导入）
+
+「凭据…」不再只是一张只读清单：
+
+- 每条**带 dsh 里的显示名**（从 profile 补丁层反查 `displayName` / 插件名，看得出"这条是干嘛的"）；
+- 点「显示 / 编辑」才取**明文值**（一次一条、独立接口、只在本机回环上），可改可存；
+- 「删除」单条、「新增 / 覆盖」一个条目、「从这条 lane 导入」整份合并（修坏文件就走这条）；
+- 都先备份 `.bak`、写后校验、不过自动回滚。
+
+命令行同步补齐：`keys [--show]`（带显示名 / 明文）、`set-key`（`--value` 或 `--from-env`）、`rm-key`。
+
+### 新：自定义服务商面板（写 dsh「设置 → 模型」的同一处）
+
+写 profile 补丁层的 `llm-pi-ai` → `config.providers.<route>`，密钥顺手存进 `.credentials.yaml`
+的 `<ROUTE>_API_KEY`：route 正则、keyRef 命名、协议取值都抄 dsh 自己的契约。默认**拒绝覆盖**
+已存在的同名 route（怕冲掉调好的地址 / 模型），勾了「允许覆盖」才替换；只填显示名 / 地址
+不改 key 时，原来的 `apiKeyEnv` 会保留而不是被抹掉。命令：`provider-list` / `provider-add [--overwrite]`。
+
+### 新：插件就地开关 / 卸载 / 加装
+
+「插件库」里每个插件多了按钮：**启用 / 禁用**（写它真实的行 id，写后宿主校验，不过自动回滚）、
+**卸载**（`dsh plugin remove` + 摘掉依赖与 `dsh.profile.bundles` 登记 + 清补丁行）、
+以及**加装**（填包名或 `@scope/name@版本`）。官方组合包、宿主基础设施、插件市场一律拒绝动。
+命令：`plugin-add` / `plugin-rm [--clean-rows]`。
+
+### 新：「配置文件…」一键看 / 定位
+
+列出这条 lane 的 `cordis.patch.yml`（补丁层）、`.credentials.yaml`、profile 的 `package.json`、
+`pnpm-lock.yaml`、`pnpm-workspace.yaml`、`node_modules/.modules.yaml`：内容是只读预览
+（超过 400 KB 截断），旁边一个「在资源管理器里定位」用 `explorer /select,` 打开。
+后端只认白名单：任意路径一律拒绝。
+
+### 改：插件迁移自动过滤「两边同版本」
+
+两边装的是同一个版本时，重装一次既费时又可能把目标里已经调好的东西（软链、本地改动）覆盖掉。
+现在计划里直接标成「自动过滤」并给出理由，界面还会汇总一行「已自动过滤 N 个」。
+源里只有清单登记、其实没装上的（`mode=install`）同样过滤。
+
+---
+
 ## v0.6.3 — 2026-10-18
 
 ### 体验：备份/恢复改为后台运行，可随时回到主界面

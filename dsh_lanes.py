@@ -1741,11 +1741,123 @@ def credentials_path(home) -> Path:
     return Path(home) / CRED_FILENAME
 
 
-def _refs_block(lines: list[str]) -> tuple[dict[str, str], int, int]:
-    """在 .credentials.yaml 的行里定位 `refs:` 段。
+# 一条 refs 条目：`  KEY: value`。键可能是裸键 / 单引号 / 双引号。
+_CRED_ENTRY_RE = re.compile(
+    r"^(?P<indent>[ \t]+)(?P<key>(?:[^\s:#][^:]*?)|'(?:[^']|'')*'|\"[^\"]*\")"
+    r"\s*:\s*(?P<val>.*)$"
+)
 
-    只做定点文本解析：不引入 yaml 依赖，也不会动 `records:` 等其它段。
-    返回 (refs, 段起始行号, 段结束行号)，找不到时 (-1, -1)。
+# 界面 / 命令里**手写**条目名时的合法形状（大写习惯，如 MY_API_KEY）。
+CRED_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
+# YAML 双引号标量支持的转义（JSON 只覆盖其中一部分，所以自己解一遍）
+_CRED_ESCAPES = {
+    "0": "\0", "a": "\a", "b": "\b", "t": "\t", "n": "\n", "v": "\v", "f": "\f",
+    "r": "\r", "e": "\x1b", "\\": "\\", '"': '"', "/": "/",
+    "N": "\x85", "_": "\xa0", "L": "\u2028", "P": "\u2029", " ": " ",
+}
+
+
+def _cred_read_lines(path: Path) -> tuple[list[str], str]:
+    """读成 (行列表, 行尾符)。不存在的文件 → ([], "\\n")。行尾符原样保留，写回不改口味。"""
+    if not path.is_file():
+        return [], "\n"
+    text = path.read_text(encoding="utf-8")
+    eol = "\r\n" if "\r\n" in text else "\n"
+    lines = text.split(eol)
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines, eol
+
+
+def _cred_open_quote(raw: str) -> str | None:
+    """这段值是不是"引号开了还没合上"（＝后面还有续行）。返回引号字符或 None。"""
+    text = raw.strip()
+    if not text or text[0] not in "'\"":
+        return None
+    quote = text[0]
+    body = text[1:]
+    i = 0
+    while i < len(body):
+        ch = body[i]
+        if quote == "'":
+            if ch == "'":
+                if i + 1 < len(body) and body[i + 1] == "'":
+                    i += 2
+                    continue
+                return None
+        else:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == '"':
+                return None
+        i += 1
+    return quote
+
+
+def _cred_unescape_double(body: str) -> str:
+    """双引号标量内容 → 原字符串。先试 JSON（dsh 写的值都是 JSON 形态），不行再按 YAML 转义表。"""
+    try:
+        return json.loads('"' + body + '"')
+    except Exception:
+        pass
+    out: list[str] = []
+    i = 0
+    while i < len(body):
+        ch = body[i]
+        if ch == "\\" and i + 1 < len(body):
+            nxt = body[i + 1]
+            if nxt in _CRED_ESCAPES:
+                out.append(_CRED_ESCAPES[nxt])
+                i += 2
+                continue
+            if nxt in "xuU":
+                width = {"x": 2, "u": 4, "U": 8}[nxt]
+                try:
+                    out.append(chr(int(body[i + 2:i + 2 + width], 16)))
+                    i += 2 + width
+                    continue
+                except ValueError:
+                    pass
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _cred_scalar(raw: str) -> str:
+    """一段标量文本 → 字符串值（单/双引号、跨行折叠后的形态都认）。"""
+    text = raw.strip()
+    if not text:
+        return ""
+    if text[0] == "'":
+        body = text[1:]
+        if body.endswith("'"):
+            body = body[:-1]
+        return body.replace("''", "'")
+    if text[0] == '"':
+        body = text[1:]
+        if body.endswith('"'):
+            body = body[:-1]
+        return _cred_unescape_double(body)
+    cut = len(text)
+    for match in re.finditer(r"\s#", text):
+        cut = match.start()
+        break
+    return text[:cut].rstrip()
+
+
+def _cred_key(raw: str) -> str:
+    text = raw.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "'\"":
+        return _cred_scalar(text)
+    return text
+
+
+def _refs_section(lines: list[str]) -> tuple[int, int]:
+    """`refs:` 段的行区间 [起始, 结束)；找不到 → (-1, -1)。
+
+    只做定点文本定位：不引入 yaml 依赖，也不会动 `records:` 等其它段。
     """
     start = -1
     for i, line in enumerate(lines):
@@ -1753,75 +1865,696 @@ def _refs_block(lines: list[str]) -> tuple[dict[str, str], int, int]:
             start = i
             break
     if start < 0:
-        return {}, -1, -1
-    refs: dict[str, str] = {}
+        return -1, -1
     end = len(lines)
     for j in range(start + 1, len(lines)):
         line = lines[j]
-        if not line.strip() or not line[:1].isspace():
-            end = j  # 空行或顶格的新段（records: …）都表示 refs 结束
+        if line.strip() and not line[:1].isspace():
+            end = j          # 顶格的新段（records: … / version: …）＝ refs 结束
             break
-        m = re.match(r"^\s+([^\s:#][^:]*):\s*(.*)$", line)
-        if m:
-            refs[m.group(1).strip()] = m.group(2).strip()
-    return refs, start, end
+    return start, end
+
+
+def _ref_entries(lines: list[str], start: int, end: int) -> list[dict]:
+    """refs 段里的条目：[{key, value, line_start, line_end}]。
+
+    关键点：dsh 自己写长 token 时会**把一个单引号标量断成好几行**（中间还夹着 JSON 的
+    逗号与空格）。按 YAML 折叠规则，行间断点折成一个空格 —— 所以这里把续行拼回一行再解。
+    旧版逐行正则只取了第一行，导入时把那半行写回去 → 引号不闭合 → YAML 直接坏掉（那个 bug）。
+    """
+    entries: list[dict] = []
+    if start < 0:
+        return entries
+    base: int | None = None
+    i = start + 1
+    while i < end:
+        raw = lines[i]
+        if not raw.strip():
+            i += 1
+            continue
+        match = _CRED_ENTRY_RE.match(raw)
+        if not match:
+            i += 1
+            continue
+        indent = len(match.group("indent"))
+        if base is None:
+            base = indent
+        if indent != base:
+            i += 1
+            continue
+        parts = [match.group("val")]
+        quote = _cred_open_quote(match.group("val"))
+        j = i + 1
+        while quote and j < end and lines[j].strip():
+            parts.append(lines[j].strip())
+            quote = _cred_open_quote(" ".join(parts))
+            j += 1
+        entries.append({
+            "key": _cred_key(match.group("key")),
+            "value": _cred_scalar(" ".join(parts)),
+            "line_start": i,
+            "line_end": j,
+        })
+        i = j
+    return entries
 
 
 def read_credential_refs(home) -> dict[str, str]:
-    """读出某个 DSH_HOME 里已存的密钥引用（refs 段，如 DEEPSEEK_API_KEY）。"""
+    """读出某个 DSH_HOME 里已存的密钥引用（refs 段，如 DEEPSEEK_API_KEY → 真值）。
+
+    值是**解码后**的字符串：单/双引号剥掉、跨行折回一行。所以它可以直接写进界面、
+    也可以原样再写回文件（写入时统一走 JSON 双引号标量，不会再半行半行地丢）。
+    """
     path = credentials_path(home)
     if not path.is_file():
         return {}
     try:
-        return _refs_block(path.read_text(encoding="utf-8").splitlines())[0]
+        lines, _ = _cred_read_lines(path)
+        start, end = _refs_section(lines)
+        return {e["key"]: e["value"] for e in _ref_entries(lines, start, end)}
     except Exception:
         return {}
 
 
-def merge_credential_refs(path: Path, refs: dict[str, str]) -> list[str]:
-    """把 refs 合并进凭据文件：缺则插入、有则更新，其它内容原样保留。
+def credential_ref_value(home, name: str) -> str | None:
+    """取一个条目的值（界面「显示」按钮用）；不存在 → None。"""
+    return read_credential_refs(home).get(name)
 
-    返回**实际被改动**的键名列表（已经是同样值的不算）。
+
+def _cred_fmt_key(key: str) -> str:
+    return key if re.fullmatch(r"[A-Za-z0-9_.-]+", key) else json.dumps(key, ensure_ascii=False)
+
+
+def _cred_fmt_entry(key: str, value: str) -> str:
+    """一条条目写成一行：值走 JSON 双引号标量（JSON 转义是 YAML 双引号转义的子集）。"""
+    return f"  {_cred_fmt_key(key)}: {json.dumps(value, ensure_ascii=False)}"
+
+
+def _cred_apply_lines(lines: list[str], start: int, end: int,
+                      changes: dict[str, str | None]) -> list[str]:
+    """按行重写 refs 段：changes 里 value=None 表示删除该条目。
+
+    没被点名的条目**原样保留**（逐行搬，不重新序列化）—— 这是"只动该动的行"的落实处。
     """
-    lines: list[str] = []
-    if path.is_file():
-        try:
-            lines = path.read_text(encoding="utf-8").splitlines()
-        except Exception:
-            lines = []
+    if start < 0:
+        added = [_cred_fmt_entry(k, v) for k, v in changes.items() if v is not None]
+        if not added:
+            return lines
+        idx = next((i + 1 for i, ln in enumerate(lines)
+                    if ln.strip().startswith("version:")), 0)
+        return lines[:idx] + ["refs:"] + added + lines[idx:]
+    entries = {e["line_start"]: e for e in _ref_entries(lines, start, end)}
+    appended = [_cred_fmt_entry(k, v) for k, v in changes.items()
+                if v is not None and k not in {e["key"] for e in entries.values()}]
+    out: list[str] = []
+    i = 0
+    total = len(lines)
+    while i < total:
+        if appended and i == end:
+            out.extend(appended)
+            appended = []
+        entry = entries.get(i)
+        if entry is not None:
+            key = entry["key"]
+            if key in changes:
+                value = changes[key]
+                if value is not None:
+                    out.append(_cred_fmt_entry(key, value))
+            else:
+                out.extend(lines[i:entry["line_end"]])
+            i = entry["line_end"]
+            continue
+        out.append(lines[i])
+        i += 1
+    if appended:
+        out.extend(appended)
+    return out
+
+
+def _cred_write(path: Path, lines: list[str], eol: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(eol.join(lines) + eol, encoding="utf-8")
+
+
+def _cred_backup(path: Path) -> str:
+    if not path.is_file():
+        return ""
+    bak = path.with_name(path.name + ".bak")
+    try:
+        shutil.copy2(path, bak)
+        return str(bak)
+    except OSError:
+        return ""
+
+
+def _cred_rebuild_section(lines: list[str], start: int, end: int,
+                          refs: dict[str, str]) -> list[str]:
+    """整个 refs 段**重写**一遍：所有条目重新序列化，段外的行一个字节不动。
+
+    这是"修复"路径专用：文件已经坏掉时（未闭合的引号会把后续行都吞进那个标量），
+    定点改行救不回来 —— 只能把 refs 段整体重铺一次干净的单行标量。
+    """
+    body = [_cred_fmt_entry(k, v) for k, v in refs.items()]
+    if start < 0:
+        idx = next((i + 1 for i, ln in enumerate(lines)
+                    if ln.strip().startswith("version:")), 0)
+        return lines[:idx] + ["refs:"] + body + lines[idx:]
+    return lines[:start] + ["refs:"] + body + lines[end:]
+
+
+def merge_credential_refs(path: Path, refs: dict[str, str],
+                          rebuild: bool = False) -> list[str]:
+    """把 refs 合并进凭据文件：缺则插入、有则更新，其它行一个字节不动。
+
+    值一律写成 YAML 双引号标量。旧版把解析出来的半行原样写回，跨行 token 会被写坏；
+    现在写出去的一行无论多长都合法，dsh 读回来与源值逐字相等。
+
+    `rebuild=True`：整个 refs 段重铺（修复坏文件用），能读出来的条目会保留、
+    点名的一律覆盖。返回**实际被改动**的键名列表（已经是同样值的不算）。
+    """
+    lines, eol = _cred_read_lines(path)
     # `version: 1` 这一行是必需的：0.1.7 的 credentials-local 会把没有它的文件判成
     # "pre-release flat layout" 并**直接拒绝加载**，然后一串等 `credentials` 服务的插件
     # 全都起不来（新建的 lane 会表现为"启动超时、没抓到 URL"）。
-    # 实测：create 出来的 plgtest 就是这个死法，日志里写着
-    # `uses the pre-release flat layout. Add version: 1 and nest the existing 1 entry under refs:`。
-    # 必须**在读 refs 段之前**补这一行，否则行号会错位（第一版就踩了：补完再按旧行号
-    # 替换，把刚插的 version 行换掉了，文件里出现两个 refs: → DUPLICATE_KEY）。
+    # 必须**在读 refs 段之前**补这一行，否则行号会错位。
     if not any(line.strip().startswith("version:") for line in lines):
         lines.insert(0, "version: 1")
-    existing, start, end = _refs_block(lines)
-    merged = dict(existing)
-    touched: list[str] = []
-    for key, val in refs.items():
-        if merged.get(key) != val:
-            touched.append(key)
-        merged[key] = val
-    block = ["refs:"] + [f"  {k}: {v}" for k, v in merged.items()]
-    if start < 0:
-        # 没有 refs 段：插在 version: 行之后（DSH 写的文件都是这个顺序），否则放最前
-        idx = next(
-            (i + 1 for i, ln in enumerate(lines) if ln.strip().startswith("version:")), 0
-        )
-        lines[idx:idx] = block
-    else:
-        lines[start:end] = block
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.is_file():
-        try:  # 改的是已有文件（含它自己的 browser-session 记录）→ 先留一份
-            shutil.copy2(path, path.with_name(path.name + ".bak"))
-        except Exception:
-            pass
-    path.write_text("\n".join(lines).rstrip("\n") + "\n", encoding="utf-8")
-    return touched
+    start, end = _refs_section(lines)
+    current = {e["key"]: e["value"] for e in _ref_entries(lines, start, end)}
+    changes = {k: v for k, v in refs.items() if current.get(k) != v}
+    if rebuild:
+        merged = {**current, **refs}
+        new_lines = _cred_rebuild_section(lines, start, end, merged)
+        _cred_backup(path)
+        _cred_write(path, new_lines, eol)
+        return sorted(refs)
+    if not changes:
+        return []
+    new_lines = _cred_apply_lines(lines, start, end, changes)
+    _cred_backup(path)
+    _cred_write(path, new_lines, eol)
+    return [k for k in refs if k in changes]
+
+
+def set_credential_ref(home, name: str, value: str) -> list[str]:
+    """改/加一个条目（单条）。返回被改动的键名列表。"""
+    return merge_credential_refs(credentials_path(home), {name: value})
+
+
+def set_credential_refs(cfg: dict, lane: str, refs: dict[str, str],
+                        verify: bool = True, force: bool = False,
+                        rebuild: bool = False) -> dict:
+    """写多个条目，并在写后用**宿主自己的解析器**校验一次；不过就回滚。
+
+    为什么先拦：文件本身已经坏了的时候（就是用户遇到的那个 MISSING_CHAR），
+    再往里写只会把水搅得更浑 —— 这时候要的是"重新导入/重建"，不是继续填。
+
+    `rebuild=True` 就是那条"重建"路径：整个 refs 段重铺（能读出来的条目保留），
+    所以坏文件也救得回来；照样写后校验、不过回滚。
+    """
+    home = lane_home(cfg, lane)
+    path = credentials_path(home)
+    out = {"ok": False, "path": str(path), "backup": "", "written": [],
+           "verify": "skip", "verify_why": "", "error": "", "rollback": "",
+           "rebuilt": bool(rebuild)}
+    if path.is_file() and not force and not rebuild:
+        verdict, why = judge_yaml_file(cfg, lane, path)
+        if verdict == "bad":
+            out["verify"], out["verify_why"] = verdict, why
+            out["error"] = (f"当前凭据文件解析不过（{why}）—— 没有往里写。"
+                            "先用「从别的 lane 重新导入」或手工修好，再改条目")
+            return out
+    try:
+        out["written"] = merge_credential_refs(path, refs, rebuild=rebuild)
+    except Exception as exc:  # noqa: BLE001
+        out["error"] = f"{type(exc).__name__}: {exc}"
+        return out
+    bak = path.with_name(path.name + ".bak")
+    out["backup"] = str(bak) if bak.is_file() else ""
+    if not out["written"]:
+        out["ok"] = True
+        out["verify_why"] = "值本来就一致，文件一个字都没动"
+        return out
+    verdict, why = judge_yaml_file(cfg, lane, path) if verify else ("skip", "没做校验")
+    out["verify"], out["verify_why"] = verdict, why
+    if verdict == "bad":
+        bak = path.with_name(path.name + ".bak")
+        if bak.is_file():
+            try:
+                shutil.copy2(bak, path)
+                out["rollback"] = f"校验不过（{why}）—— 已用 .bak 回滚"
+            except OSError as exc:
+                out["rollback"] = f"校验不过（{why}）—— 回滚也失败了：{exc}"
+        else:
+            out["rollback"] = f"校验不过（{why}）—— 没有备份可回滚"
+        out["error"] = out["rollback"]
+        return out
+    out["ok"] = True
+    return out
+
+
+def delete_credential_refs(cfg: dict, lane: str, names: list[str],
+                           verify: bool = True) -> dict:
+    """删掉若干条目（写后用宿主解析器校验，不过就回滚）。"""
+    home = lane_home(cfg, lane)
+    path = credentials_path(home)
+    out = {"ok": False, "path": str(path), "backup": "", "removed": [],
+           "verify": "skip", "verify_why": "", "error": "", "rollback": ""}
+    if not path.is_file():
+        out["ok"] = True
+        out["verify_why"] = "凭据文件还不存在，没有可删的条目"
+        return out
+    lines, eol = _cred_read_lines(path)
+    start, end = _refs_section(lines)
+    present = {e["key"] for e in _ref_entries(lines, start, end)}
+    wanted = [n for n in names if n in present]
+    if not wanted:
+        out["ok"] = True
+        out["verify_why"] = "这些条目本来就不在文件里"
+        return out
+    verdict, why = judge_yaml_file(cfg, lane, path)
+    if verdict == "bad":
+        out["verify"], out["verify_why"] = verdict, why
+        out["error"] = (f"当前凭据文件解析不过（{why}）—— 没有动它。"
+                        "先用「从别的 lane 重新导入」或手工修好，再删条目")
+        return out
+    new_lines = _cred_apply_lines(lines, start, end, {n: None for n in wanted})
+    out["backup"] = _cred_backup(path)
+    _cred_write(path, new_lines, eol)
+    out["removed"] = wanted
+    verdict, why = judge_yaml_file(cfg, lane, path) if verify else ("skip", "没做校验")
+    out["verify"], out["verify_why"] = verdict, why
+    if verdict == "bad":
+        bak = path.with_name(path.name + ".bak")
+        if bak.is_file():
+            shutil.copy2(bak, path)
+            out["rollback"] = f"校验不过（{why}）—— 已用 .bak 回滚"
+        else:
+            out["rollback"] = f"校验不过（{why}）—— 没有备份可回滚"
+        out["error"] = out["rollback"]
+        return out
+    out["ok"] = True
+    return out
+
+
+# ======================= 自定义服务商（llm-pi-ai providers） =======================
+#
+# DSH 的「设置 → 模型」页允许手写一个服务商：route（小写短名）+ 协议 + baseURL +
+# 模型清单 + 一个密钥引用。它把这条写进 profile 补丁层的 llm-pi-ai 条目
+# （config.providers.<route>），密钥本体写进 .credentials.yaml 的 refs 段。
+# 这里按**同一套契约**自己写一遍（route 正则、${ROUTE}_API_KEY 命名都抄 dsh），
+# 界面因此能做到和那个页面一样；写后一样用宿主 js-yaml 校验，不过就回滚。
+
+PKG_LLM_PI_AI = "@deepseek-ai/dsh-llm-pi-ai"
+PROVIDER_ROUTE_RE = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
+PROVIDER_APIS = ("openai-completions", "openai-responses", "anthropic-messages")
+
+# route → 约定俗成的凭据条目名（与 dsh 自己的 deriveKeyRef 一字不差：
+# `${route.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}_API_KEY`）。
+def provider_key_ref(route: str) -> str:
+    return re.sub(r"[^A-Z0-9]+", "_", route.upper()) + "_API_KEY"
+
+
+_CRED_SAFE_PLAIN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _./:+@,()\[\]{}-]*$")
+_CRED_PLAIN_RESERVED = {"true", "false", "null", "~", "yes", "no", "on", "off"}
+
+# 常见官方插件：补丁层里不写 apiKeyEnv 时它们用的默认条目 → 显示名
+CRED_DEFAULT_SOURCES = {
+    "dsh-llm-deepseek-api-key": ("DEEPSEEK_API_KEY", "DeepSeek（官方账号）"),
+    "dsh-web-search-deepseek": ("DEEPSEEK_API_KEY", "联网搜索（DeepSeek）"),
+}
+
+
+def _yaml_scalar(text: str) -> str:
+    """能裸写就裸写，否则走 JSON 双引号标量（合法 YAML）。"""
+    if text and _CRED_SAFE_PLAIN_RE.match(text) and text.lower() not in _CRED_PLAIN_RESERVED:
+        return text
+    return json.dumps(text, ensure_ascii=False)
+
+
+def validate_provider(route: str, api: str, base_url: str, models: list[dict]) -> str:
+    """校验一个服务商定义；返回 "" 表示通过，否则是给人看的原因。"""
+    if not PROVIDER_ROUTE_RE.match(route or ""):
+        return "route 只能是小写字母/数字/连字符，且以字母开头（例：acme-gateway）"
+    if api not in PROVIDER_APIS:
+        return f"协议只能填 {'、'.join(PROVIDER_APIS)}"
+    if not re.match(r"^https?://\S+$", (base_url or "").strip()):
+        return "baseURL 必须是 http:// 或 https:// 开头的地址"
+    if not models:
+        return "至少要有一个模型（id 必填）"
+    seen: set[str] = set()
+    for index, model in enumerate(models, 1):
+        mid = str(model.get("id") or "").strip()
+        if not mid:
+            return f"第 {index} 个模型缺 id"
+        if mid in seen:
+            return f"模型 id 重复：{mid}"
+        seen.add(mid)
+    return ""
+
+
+def _patch_entry_spans(lines: list[str]) -> list[tuple[str, int, int]]:
+    """顶层条目的 (id, 起始行, 结束行)。id 取不到时是 ""。"""
+    spans: list[tuple[str, int, int]] = []
+    cur_start: int | None = None
+    cur_id = ""
+    for i, raw in enumerate(lines):
+        if raw.startswith("- ") or raw.rstrip() == "-":
+            if cur_start is not None:
+                spans.append((cur_id, cur_start, i))
+            match = ENTRY_ID_RE.match(raw.rstrip())
+            cur_id = match.group(1) if match else ""
+            cur_start = i
+    if cur_start is not None:
+        spans.append((cur_id, cur_start, len(lines)))
+    return spans
+
+
+def _entry_name(lines: list[str], start: int, end: int) -> str:
+    for raw in lines[start:end]:
+        match = re.match(r"^ {2}name:\s*(.+?)\s*$", raw)
+        if match:
+            return _cred_scalar(match.group(1))
+    return ""
+
+
+def _is_pi_ai_entry(lines: list[str], start: int, end: int, ident: str) -> bool:
+    return ident == "llm-pi-ai" or _entry_name(lines, start, end) == PKG_LLM_PI_AI
+
+
+def _providers_span(lines: list[str], estart: int, eend: int):
+    """llm-pi-ai 条目里的 providers 段 → (providers 行, 追加点, [(route, 起, 止)]); 没有 → None。"""
+    pline = -1
+    for i in range(estart, eend):
+        if re.match(r"^ {4}providers:\s*(#.*)?$", lines[i]):
+            pline = i
+            break
+    if pline < 0:
+        return None
+    routes: list[tuple[str, int]] = []
+    i = pline + 1
+    while i < eend:
+        raw = lines[i]
+        if raw.strip() and not raw[:1].isspace():
+            break
+        indent = len(raw) - len(raw.lstrip())
+        if raw.strip() and indent <= 4:
+            break
+        match = re.match(r"^ {6}([A-Za-z0-9_.-]+):\s*$", raw)
+        if match:
+            routes.append((match.group(1), i))
+        i += 1
+    insert_at = i
+    spans = []
+    for index, (route, lstart) in enumerate(routes):
+        lend = routes[index + 1][1] if index + 1 < len(routes) else insert_at
+        spans.append((route, lstart, lend))
+    return pline, insert_at, spans
+
+
+def _provider_lines(route: str, provider: dict) -> list[str]:
+    out = [f"      {route}:"]
+    if provider.get("displayName"):
+        out.append(f"        displayName: {_yaml_scalar(str(provider['displayName']))}")
+    if provider.get("apiKeyEnv"):
+        out.append(f"        apiKeyEnv: {_yaml_scalar(str(provider['apiKeyEnv']))}")
+    out.append(f"        api: {_yaml_scalar(str(provider['api']))}")
+    out.append(f"        baseURL: {_yaml_scalar(str(provider['baseURL']))}")
+    out.append("        models:")
+    for model in provider.get("models") or []:
+        mid = str(model.get("id") or "").strip()
+        out.append(f"          - id: {_yaml_scalar(mid)}")
+        name = str(model.get("name") or mid).strip() or mid
+        out.append(f"            name: {_yaml_scalar(name)}")
+        ctx = model.get("contextWindow")
+        if isinstance(ctx, int) and ctx > 0:
+            out.append(f"            contextWindow: {ctx}")
+        max_tokens = model.get("maxTokens")
+        if isinstance(max_tokens, int) and max_tokens > 0:
+            out.append(f"            maxTokens: {max_tokens}")
+    return out
+
+
+def upsert_provider_in_patch(text: str, route: str, provider: dict,
+                             overwrite: bool = False) -> tuple[bool, str, str, str]:
+    """把一条服务商写进补丁层的 llm-pi-ai 条目 → (ok, why, 新文本, 动作)。
+
+    动作：added / replaced / none（一字未改）/ refused。条目/段不存在时会照着
+    dsh 自己写出来的层级（2/4/6/8 空格）补出来，不猜缩进。
+    """
+    lines = text.splitlines()
+    listing = text.splitlines()
+    target = next(((s, e) for ident, s, e in _patch_entry_spans(listing)
+                   if _is_pi_ai_entry(listing, s, e, ident)), None)
+    provider_lines = _provider_lines(route, provider)
+    if target is None:
+        entry = ["- id: llm-pi-ai", f"  name: {json.dumps(PKG_LLM_PI_AI)}", "  config:",
+                 "    providers:", *provider_lines]
+        # 用 append_patch_entries 而不是自己拼：它会先把 `[]` 占位符注释掉，
+        # 否则"[] 后面再跟一个 - id:"＝一份文档里两个顶层元素，宿主直接报
+        # "end of the stream or a document separator is expected"。
+        ok_add, why_add, joined = append_patch_entries(text, entry)
+        if not ok_add:
+            return False, why_add, text, "refused"
+        return True, "", joined, "added"
+    estart, eend = target
+    span = _providers_span(lines, estart, eend)
+    if span is None:
+        cfg_line = next((i for i in range(estart + 1, eend)
+                         if re.match(r"^ {2}config:\s*(#.*)?$", lines[i])), -1)
+        if cfg_line >= 0:
+            at = cfg_line + 1
+            while at < eend and (not lines[at].strip()
+                                 or len(lines[at]) - len(lines[at].lstrip()) > 2):
+                at += 1
+            insert = ["    providers:", *provider_lines]
+        else:
+            at = eend
+            insert = ["  config:", "    providers:", *provider_lines]
+        new_lines = lines[:at] + insert + lines[at:]
+        return True, "", "\n".join(new_lines) + "\n", "added"
+    _pline, insert_at, route_spans = span
+    existing = next((rs for rs in route_spans if rs[0] == route), None)
+    if existing is not None:
+        if not overwrite:
+            return False, f"这个 profile 里已经有 route「{route}」了（要改就选覆盖）", text, "refused"
+        rstart, rend = existing[1], existing[2]
+        new_lines = lines[:rstart] + provider_lines + lines[rend:]
+        return True, "", "\n".join(new_lines) + "\n", "replaced"
+    new_lines = lines[:insert_at] + provider_lines + lines[insert_at:]
+    return True, "", "\n".join(new_lines) + "\n", "added"
+
+
+def lane_custom_providers(cfg: dict, lane: str, profile: str = DEFAULT_PROFILE) -> list[dict]:
+    """这个 profile 补丁层里手写的服务商清单（只读）。"""
+    path = plugin_patch_path(cfg, lane, profile)
+    if not path.is_file():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    out: list[dict] = []
+    for ident, start, end in _patch_entry_spans(lines):
+        if not _is_pi_ai_entry(lines, start, end, ident):
+            continue
+        span = _providers_span(lines, start, end)
+        if span is None:
+            continue
+        for route, rstart, rend in span[2]:
+            info = {"route": route, "profile": profile, "displayName": "",
+                    "apiKeyEnv": "", "api": "", "baseURL": "", "models": []}
+            for raw in lines[rstart:rend]:
+                match = re.match(r"^ {8}(displayName|apiKeyEnv|api|baseURL):\s*(.+?)\s*$", raw)
+                if match:
+                    info[match.group(1)] = _cred_scalar(match.group(2))
+                else:
+                    mid = re.match(r"^ {10}- id:\s*(.+?)\s*$", raw)
+                    if mid:
+                        info["models"].append(_cred_scalar(mid.group(1)))
+            out.append(info)
+    return out
+
+
+def _cred_sources_of_patch(path: Path, profile: str) -> list[tuple[str, dict]]:
+    if not path.is_file():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    pairs: list[tuple[str, dict]] = []
+    for ident, start, end in _patch_entry_spans(lines):
+        name = _entry_name(lines, start, end)
+        short = name.rsplit("/", 1)[-1] if name else (ident or "")
+        if _is_pi_ai_entry(lines, start, end, ident):
+            span = _providers_span(lines, start, end)
+            for route, rstart, rend in (span[2] if span else []):
+                ref = ""
+                display = ""
+                api = ""
+                base_url = ""
+                for raw in lines[rstart:rend]:
+                    match = re.match(
+                        r"^ {8}(displayName|apiKeyEnv|api|baseURL):\s*(.+?)\s*$", raw)
+                    if match:
+                        key, value = match.group(1), _cred_scalar(match.group(2))
+                        if key == "apiKeyEnv":
+                            ref = value
+                        elif key == "displayName":
+                            display = value
+                        elif key == "api":
+                            api = value
+                        elif key == "baseURL":
+                            base_url = value
+                ref = ref or provider_key_ref(route)
+                pairs.append((ref, {"kind": "provider", "displayName": display or route,
+                                    "route": route, "profile": profile, "api": api,
+                                    "baseURL": base_url}))
+            continue
+        ref = ""
+        display = ""
+        for raw in lines[start:end]:
+            match = re.match(r"^\s+apiKeyEnv:\s*(.+?)\s*$", raw)
+            if match and not ref:
+                ref = _cred_scalar(match.group(1))
+            match = re.match(r"^\s+displayName:\s*(.+?)\s*$", raw)
+            if match and not display:
+                display = _cred_scalar(match.group(1))
+        default = CRED_DEFAULT_SOURCES.get(short)
+        if not ref and default:
+            ref = default[0]
+        if not display and default:
+            display = default[1]
+        if ref:
+            pairs.append((ref, {"kind": "plugin", "displayName": display or short or ref,
+                                "route": "", "profile": profile, "api": "", "baseURL": ""}))
+    return pairs
+
+
+def lane_credential_sources(cfg: dict, lane: str) -> dict[str, list[dict]]:
+    """凭据条目（refs 键）→ 谁在引用它（带 dsh 里设的显示名）。只读、失败一律降级成空。"""
+    out: dict[str, list[dict]] = {}
+    home = lane_home(cfg, lane)
+    profiles: list[str] = []
+    proot = home / "profiles"
+    if proot.is_dir():
+        profiles = sorted(p.name for p in proot.iterdir() if p.is_dir())
+    for profile in profiles:
+        try:
+            pairs = _cred_sources_of_patch(plugin_patch_path(cfg, lane, profile), profile)
+        except Exception:  # noqa: BLE001
+            pairs = []
+        for ref, item in pairs:
+            out.setdefault(ref, []).append(item)
+    return out
+
+
+def write_custom_provider(cfg: dict, lane: str, profile: str, route: str, api: str,
+                          base_url: str, models: list[dict], display_name: str = "",
+                          api_key: str = "", store_key: bool = True,
+                          overwrite: bool = False, verify: bool = True) -> dict:
+    """新增/覆盖一个自定义服务商：写补丁层（+ 顺手把密钥写进凭据 refs），写完校验、不过回滚。"""
+    out = {"ok": False, "route": route, "profile": profile, "action": "",
+           "keyRef": "", "path": "", "backup": "", "verify": "skip", "verifyWhy": "",
+           "credential": None, "error": "", "rollback": ""}
+    why = validate_provider(route, api, base_url, models)
+    if why:
+        out["error"] = why
+        return out
+    if lane not in (cfg.get("lanes") or {}):
+        out["error"] = f"没有 lane「{lane}」"
+        return out
+    allowed = lane_profiles_view(cfg, lane)
+    if profile not in allowed:
+        out["error"] = (f"profile「{profile}」不在允许范围内"
+                        f"（{ '、'.join(sorted(allowed)) }）")
+        return out
+    path = plugin_patch_path(cfg, lane, profile)
+    out["path"] = str(path)
+    info = lane_profiles_view(cfg, lane).get(profile) or {}
+    if not info.get("onDisk"):
+        out["error"] = f"profile「{profile}」在磁盘上还没有（先启动一次让它初始化）"
+        return out
+    if path.is_file() and verify:
+        # 补丁层的判据必须用 dsh 自己那套（JSON_SCHEMA + `!!js` 标量），
+        # 否则文件里合法的 `!<tag:yaml.org,2002:js>` 表达式会被判成"解析不过"。
+        home, pkg_dir, install_dir = lane_judge_paths(cfg, lane)
+        verdict, why_judge = judge_patch_yaml(cfg, home, pkg_dir, path, install_dir)
+        if verdict == "bad":
+            out["verify"], out["verifyWhy"] = verdict, why_judge
+            out["error"] = (f"补丁层现在解析不过（{why_judge}）—— 没敢往里写。"
+                            "先用 `plugins <lane> --dump` 或插件总览把它修好")
+            return out
+    text = ensure_patch_array(path.read_text(encoding="utf-8") if path.is_file() else "")
+    provider: dict = {"api": api, "baseURL": base_url.strip(),
+                      "displayName": (display_name or "").strip(),
+                      "models": [dict(m) for m in models]}
+    key_ref = provider_key_ref(route)
+    if api_key and store_key:
+        provider["apiKeyEnv"] = key_ref
+    elif store_key:
+        # 不填 key 的"只改显示名 / 地址 / 模型"场景：别把原来绑好的密钥引用抹掉
+        try:
+            prior = next((p for p in lane_custom_providers(cfg, lane, profile)
+                          if p.get("route") == route and p.get("apiKeyEnv")), None)
+        except Exception:  # noqa: BLE001
+            prior = None
+        if prior:
+            provider["apiKeyEnv"] = prior["apiKeyEnv"]
+    ok_up, why_up, new_text, action = upsert_provider_in_patch(
+        text, route, provider, overwrite)
+    out["action"] = action          # refused / none 也要让调用方看得见（前端据此提示）
+    if not ok_up:
+        out["error"] = why_up
+        return out
+    out["keyRef"] = provider.get("apiKeyEnv") or "" if store_key else ""
+    if action == "none":
+        out["ok"] = True
+        out["verifyWhy"] = "文件一个字都没动"
+        return out
+    backup_ok, backup_info = backup_patch_text(path, text)
+    if not backup_ok:
+        out["error"] = f"备份失败，没敢写：{backup_info}"
+        return out
+    out["backup"] = backup_info
+    wrote, why_write = write_patch_text(path, new_text)
+    if not wrote:
+        out["error"] = f"写入失败：{why_write}"
+        return out
+    if verify:
+        home, pkg_dir, install_dir = lane_judge_paths(cfg, lane)
+        verdict, why_judge = judge_patch_yaml(cfg, home, pkg_dir, path, install_dir)
+        out["verify"], out["verifyWhy"] = verdict, why_judge
+        if verdict == "bad":
+            rolled = False
+            if Path(backup_info).is_file():
+                try:
+                    shutil.copyfile(backup_info, path)
+                    rolled = True
+                except OSError:
+                    rolled = False
+            out["rollback"] = (f"校验不过（{why_judge}）—— "
+                               + ("已用 .bak 回滚" if rolled else "回滚失败"))
+            out["error"] = out["rollback"]
+            return out
+    if api_key and store_key:
+        cred = set_credential_refs(cfg, lane, {key_ref: api_key}, verify=verify)
+        out["credential"] = {"ok": bool(cred.get("ok")), "ref": key_ref,
+                             "error": cred.get("error", ""),
+                             "verify": cred.get("verify", ""),
+                             "verifyWhy": cred.get("verify_why", "")}
+        if not cred.get("ok"):
+            if Path(backup_info).is_file():     # 原子性：密钥没写上就别留半条服务商
+                try:
+                    shutil.copyfile(backup_info, path)
+                    out["rollback"] = "凭据写入失败，补丁层已回滚"
+                except OSError:
+                    out["rollback"] = "凭据写入失败，补丁层回滚也没成功"
+            out["error"] = cred.get("error") or "凭据写入失败"
+            return out
+    out["ok"] = True
+    return out
 
 
 def copy_credential_refs(cfg: dict, src: str, dst: str,
@@ -2904,10 +3637,156 @@ def cmd_keys(cfg: dict, args) -> int:
     if not refs:
         warn("  （没有 refs 段——这个 HOME 里还没有 API key）")
         return 0
+    try:
+        sources = lane_credential_sources(cfg, lane)
+    except Exception:  # noqa: BLE001
+        sources = {}
     for key in sorted(refs):
-        info(f"  · {key}")
+        users = sources.get(key) or []
+        who = "、".join(u.get("displayName") or u.get("route") or u.get("profile") or "?"
+                       for u in users)
+        info(f"  · {key}" + (col(f"    ← {who}", C.GRAY) if who else ""))
     info("")
+    if getattr(args, "show", False):
+        for key in sorted(refs):
+            info(col(f"  {key} = {refs[key]}", C.YELLOW))
+        warn("  上面是明文密钥：只在本机看，别贴到别处。")
+    info(col(f"  看明文： py {ME_NAME} keys {lane} --show", C.CYAN))
+    info(col(f"  改 / 加一条： py {ME_NAME} set-key {lane} <条目名> --value sk-...", C.CYAN))
+    info(col(f"  删条目： py {ME_NAME} rm-key {lane} <条目,条目>", C.CYAN))
     info(col(f"  复制到别的 lane： py {ME_NAME} copy-key {lane} <目标lane> [--only {sorted(refs)[0]}]", C.CYAN))
+    return 0
+
+
+def cmd_set_key(cfg: dict, args) -> int:
+    """改 / 加一条凭据（写后宿主校验，不过自动回滚）。"""
+    lane = args.lane
+    if lane not in cfg.get("lanes", {}):
+        fail(f"没有 lane「{lane}」")
+        return 1
+    name = str(args.name or "").strip()
+    if not CRED_KEY_RE.match(name):
+        fail("条目名只能是字母/数字/_.-（大写习惯，如 MY_API_KEY）")
+        return 1
+    value = getattr(args, "value", None)
+    env_name = str(getattr(args, "from_env", None) or "").strip()
+    if value is None and env_name:
+        value = os.environ.get(env_name)
+        if value is None:
+            fail(f"环境变量 {env_name} 是空的")
+            return 1
+    if value is None:
+        fail("要写什么值？--value sk-... 或 --from-env MY_ENV（别把密钥留在命令行历史里）")
+        return 1
+    info(col(f"── 写凭据条目：{lane} / {name} ──", C.BOLD))
+    res = set_credential_refs(cfg, lane, {name: str(value)}, verify=True)
+    if not res.get("ok"):
+        fail(f"  {res.get('error') or res.get('verify_why')}")
+        if res.get("rollback"):
+            warn(f"  {res['rollback']}")
+        return 1
+    if not res.get("written"):
+        warn(f"  没改（{res.get('verify_why') or '值和原来一样'}）")
+        return 0
+    ok(f"  √ 已写入 {name}（{len(str(value))} 字符）")
+    if res.get("backup"):
+        info(col(f"  备份：{res['backup']}", C.GRAY))
+    if lane_runtime(cfg, lane):
+        warn("  这条 lane 有实例在跑：重启后才会用上新 key")
+    return 0
+
+
+def cmd_rm_key(cfg: dict, args) -> int:
+    """删凭据条目（写后宿主校验，不过自动回滚）。"""
+    lane = args.lane
+    if lane not in cfg.get("lanes", {}):
+        fail(f"没有 lane「{lane}」")
+        return 1
+    names = [n.strip() for raw in (getattr(args, "names", None) or [])
+             for n in str(raw).split(",") if n.strip()]
+    if not names:
+        fail("没写要删哪个条目")
+        return 1
+    info(col(f"── 删凭据条目：{lane} ──", C.BOLD))
+    res = delete_credential_refs(cfg, lane, names, verify=True)
+    if not res.get("ok"):
+        fail(f"  {res.get('error') or res.get('verify_why')}")
+        if res.get("rollback"):
+            warn(f"  {res['rollback']}")
+        return 1
+    removed = res.get("removed") or []
+    if removed:
+        ok(f"  √ 已删 {'、'.join(removed)}")
+    else:
+        warn(f"  没有可删的条目（{res.get('verify_why') or '本来就不在'}）")
+    if res.get("backup"):
+        info(col(f"  备份：{res['backup']}", C.GRAY))
+    if lane_runtime(cfg, lane):
+        warn("  这条 lane 有实例在跑：重启后才会生效")
+    return 0
+
+
+def cmd_provider_list(cfg: dict, args) -> int:
+    """列出某个 profile 补丁层里手写的自定义服务商。"""
+    lane = args.lane
+    prof = getattr(args, "profile", None) or PROFILE_NAME
+    if lane not in cfg.get("lanes", {}):
+        fail(f"没有 lane「{lane}」")
+        return 1
+    info(col(f"── 自定义服务商：{lane}/{prof} ──", C.BOLD))
+    try:
+        providers = lane_custom_providers(cfg, lane, prof)
+    except Exception as exc:  # noqa: BLE001
+        fail(f"  读不出来：{type(exc).__name__}: {exc}")
+        return 1
+    if not providers:
+        warn("  （没有手写服务商——dsh 设置里加的那些才在这里）")
+        return 0
+    for item in providers:
+        title = item.get("displayName") or item.get("route")
+        info(f"  · {title}" + col(f"  [{item.get('route')}]", C.GRAY))
+        info(col(f"      api      {item.get('api') or '?'}", C.GRAY))
+        info(col(f"      baseURL  {item.get('baseURL') or '?'}", C.GRAY))
+        ref = item.get("apiKeyEnv") or provider_key_ref(item.get("route") or "")
+        info(col(f"      keyRef   {ref}", C.GRAY))
+        if item.get("models"):
+            info(col(f"      models   {'、'.join(item['models'])}", C.GRAY))
+    info("")
+    info(col(f"  加 / 改一个： py {ME_NAME} provider-add {lane} <route> --api openai-completions "
+             f"--base-url URL --display 名字 --key sk-... --model m1,m2", C.CYAN))
+    return 0
+
+
+def cmd_provider_add(cfg: dict, args) -> int:
+    """写一个自定义服务商进补丁层（key 顺手存进凭据 refs）。"""
+    lane = args.lane
+    prof = getattr(args, "profile", None) or PROFILE_NAME
+    route = str(args.route or "").strip()
+    models = [{"id": m.strip()} for m in
+              (getattr(args, "model", None) or "").split(",") if m.strip()]
+    info(col(f"── 写自定义服务商：{lane}/{prof} / {route} ──", C.BOLD))
+    res = write_custom_provider(
+        cfg, lane, prof, route, str(getattr(args, "api", "") or ""),
+        str(getattr(args, "base_url", "") or ""), models,
+        display_name=str(getattr(args, "display", "") or ""),
+        api_key=str(getattr(args, "key", "") or ""),
+        overwrite=bool(getattr(args, "overwrite", False)), verify=True)
+    if res.get("action") == "refused":
+        fail(f"  {res.get('error')}")
+        info(col(f"      要改就加 --overwrite", C.CYAN))
+        return 1
+    if not res.get("ok"):
+        fail(f"  {res.get('error')}")
+        return 1
+    if res.get("action") == "none":
+        warn("  文件一个字都没改（内容已经一样）")
+        return 0
+    ok(f"  √ 已{'覆盖更新' if res['action'] == 'replaced' else '新增'} route「{route}」")
+    if res.get("keyRef"):
+        ok(f"  密钥已存进凭据条目 {res['keyRef']}")
+    info(col(f"  改动：{res.get('path')}", C.GRAY))
+    if lane_runtime(cfg, lane, prof):
+        warn("  这条 profile 正在运行：重启后才会让 dsh 读到新服务商")
     return 0
 
 
@@ -4491,7 +5370,7 @@ def patch_dialect_ok(text: str) -> tuple[bool, str]:
 #   2. **市场判据**：插件市场是**逐行扫**这份文件的（`readUserPatchState`），
 #      行尾带 `# 注释` 或引号的 `- id: X` 它读不到 —— 那意味着"看着关了、市场上还开着"。
 #
-# 只读不写：这里永远不改补丁层（写开关已停用）。
+# 只读不写：这个函数永远不改补丁层（改由 apply_plugin_states 写，写前备份 + 写后校验/回滚）。
 PATCH_LAYER_FILE = "cordis.patch.yml"
 MARKET_ID_LINE_RE = re.compile(r"^- id: ([A-Za-z0-9_.-]+)\s*$")
 MARKET_LOOSE_ID_RE = re.compile(r"^-\s*id:\s*\S")
@@ -4530,6 +5409,36 @@ try {
     });
   } else {
     answer({ ok: true, entries: value.length });
+  }
+} catch (err) {
+  answer({ ok: false, why: String((err && err.message) || err).split('\n')[0] });
+}
+"""
+
+
+# 通用 YAML 判决脚本：只要求"宿主那份 js-yaml 能把它读成一个映射/数组"。
+# 凭据文件（顶层是映射）与补丁层之外的 YAML 都用它；补丁层另有 YAML_JUDGE_JS（要数组）。
+YAML_PARSE_JS = r"""
+const fs = require('fs');
+const yaml = require(process.env.DSH_LANES_JUDGE_YAML);
+const answer = (payload) => { process.stdout.write(JSON.stringify(payload)); };
+let text;
+try {
+  text = fs.readFileSync(process.env.DSH_LANES_JUDGE_FILE, 'utf8');
+} catch (err) {
+  answer({ ok: false, why: '读不了文件：' + err.message });
+  process.exit(0);
+}
+try {
+  const value = yaml.load(text);
+  if (value === null || value === undefined) {
+    answer({ ok: false, why: '整份文件没有任何内容（只剩注释或空行）' });
+  } else if (typeof value !== 'object') {
+    answer({ ok: false, why: '顶层不是映射/数组（拿到一段标量）' });
+  } else {
+    const count = Array.isArray(value) ? value.length : Object.keys(value).length;
+    answer({ ok: true, why: '宿主自己的 js-yaml 解析通过（顶层 '
+      + (Array.isArray(value) ? '数组 ' : '映射 ') + count + ' 项）' });
   }
 } catch (err) {
   answer({ ok: false, why: String((err && err.message) || err).split('\n')[0] });
@@ -4599,6 +5508,51 @@ def judge_patch_yaml(cfg: dict, home, pkg_dir, path: Path, install_dir=None) -> 
         return "skip", f"外部判据跑不起来（{type(exc).__name__}: {exc}）"
     if data.get("ok"):
         return "ok", f"宿主自己的 js-yaml 解析通过（{data.get('entries')} 个条目）"
+    return "bad", str(data.get("why") or "解析失败")
+
+
+def lane_judge_paths(cfg: dict, lane: str) -> tuple[Path, Path, Path]:
+    """判决/写盘时要用的三个位置：lane 的 HOME、dsh 包目录、安装树。"""
+    home = lane_home(cfg, lane)
+    pkg_dir = package_dir_of_entry(lane_entry_script(cfg, lane))
+    return home, pkg_dir, lane_install_dir(cfg, lane)
+
+
+def judge_yaml_file(cfg: dict, lane: str, path: Path) -> tuple[str, str]:
+    """用宿主自己那份 js-yaml 真解析一份 YAML → ("ok"|"bad"|"skip", 说明)。
+
+    凭据文件、配置迁移产物都用它。找不到 node/js-yaml 就如实说 skip，绝不假装通过。
+    """
+    node = find_node(cfg)
+    if not node:
+        return "skip", "本机找不到 node"
+    home, pkg_dir, install_dir = lane_judge_paths(cfg, lane)
+    yaml_dir = find_js_yaml(home, pkg_dir, install_dir)
+    if not yaml_dir:
+        return "skip", "找不到宿主自带的那份 js-yaml"
+    env = dict(os.environ)
+    env["DSH_LANES_JUDGE_YAML"] = yaml_dir
+    env["DSH_LANES_JUDGE_FILE"] = str(path)
+    try:
+        proc = subprocess.run(
+            [node, "-e", YAML_PARSE_JS],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=120, env=env,
+            creationflags=_no_window_flags(),
+        )
+        payload = ""
+        for line in reversed((proc.stdout or "").splitlines()):
+            if line.strip().startswith("{"):
+                payload = line.strip()
+                break
+        if not payload:
+            tail = ((proc.stderr or "").strip().splitlines() or ["(没有任何输出)"])[-1]
+            return "skip", f"判决脚本没给出结论（{tail[:120]}）"
+        data = json.loads(payload)
+    except Exception as exc:  # noqa: BLE001 —— 判不了就说判不了
+        return "skip", f"外部判据跑不起来（{type(exc).__name__}: {exc}）"
+    if data.get("ok"):
+        return "ok", str(data.get("why") or "解析通过")
     return "bad", str(data.get("why") or "解析失败")
 
 
@@ -4998,8 +5952,25 @@ def apply_plugin_states(cfg: dict, lane: str, changes: list[tuple[str, bool]],
     if not ok_write:
         return {"ok": False, "changed": False, "error": f"写入失败：{why_write}",
                 "written": [], "skipped": skipped, "patch_file": patch_file}
+    # 自动校验 + 回滚：拿宿主自己的解析器真解析一遍，判不过就立刻退回写之前的原文。
+    # 这是这一版重新打开写开关的前提——以前"只写不验"，写坏了要等下次启动才发现 profile 起不来。
+    try:
+        jhome, jpkg, jinstall = lane_judge_paths(cfg, lane)
+        verdict, why_judge = judge_patch_yaml(cfg, jhome, jpkg, patch_file, jinstall)
+    except Exception as exc:  # noqa: BLE001
+        verdict, why_judge = "skip", f"外部判据跑不起来（{type(exc).__name__}: {exc}）"
+    if verdict == "bad":
+        back_ok, back_why = write_patch_text(patch_file, original)
+        rolled = f"已用备份回滚（{backup_info}）" if back_ok else \
+            f"回滚失败，请手动把备份复制回去：{backup_info} → {patch_file}（{back_why}）"
+        return {"ok": False, "changed": False,
+                "error": f"写出来的补丁层解析不过（{why_judge}）—— {rolled}",
+                "written": [], "skipped": skipped, "patch_file": patch_file,
+                "backup": backup_info, "rollback": rolled, "verify": verdict,
+                "verify_why": why_judge}
     return {"ok": True, "changed": True, "written": written, "skipped": skipped,
-            "patch_file": patch_file, "backup": backup_info, "text": text}
+            "patch_file": patch_file, "backup": backup_info, "text": text,
+            "verify": verdict, "verify_why": why_judge}
 
 
 
@@ -5510,7 +6481,9 @@ def plugin_transfer_plan(cfg: dict, src_lane: str, src_profile: str,
         if not item["installed"] and mode == "install":
             action, why = "skip", "源里其实没装上（只有清单登记）"
         elif dst_have == version and version:
-            why = f"目标里已经是 {version}"
+            # 需求①：两边同版本就别搬了——重装一次既费时又可能把目标里
+            # 已经调好的东西（软链、本地改动）覆盖掉。直接过滤掉，并在计划里说清楚。
+            action, why = "skip", f"两边都是 {version}（自动过滤）"
         items.append({
             "pkg": name, "spec": spec, "version": version, "want": after,
             "official": item["official"], "rows": list(item["rows"]),
@@ -5688,6 +6661,264 @@ def transfer_plugins(cfg: dict, src_lane: str, src_profile: str,
             "failed": [i["pkg"] for i in bad], "merge": merge}
 
 
+def _unmerge_profile_manifest(pdir: Path, pkg: str) -> dict:
+    """从 profile 的 package.json 里**摘掉**一个包：dependencies + dsh.profile.bundles。
+
+    卸载插件时必须做这一步：`dsh plugin remove`（pnpm）只会动它自己写的那部分，
+    而 `dsh.profile.bundles` 是宿主**真正加载谁**的清单——留着它，卸载过的插件下次
+    启动还会被当作"该加载"（然后因为文件没了而报错/静默跳过）。所以两处一起清。
+    """
+    manifest = pdir / "package.json"
+    res = {"ok": False, "why": "", "backup": "", "removed_dep": False, "removed_bundle": False}
+    if not manifest.is_file():
+        return {"ok": True, "why": "profile 还没有 package.json", "backup": "",
+                "removed_dep": False, "removed_bundle": False}
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        res["why"] = f"package.json 读不出来：{exc}"
+        return res
+    if not isinstance(data, dict):
+        res["why"] = "package.json 顶层不是对象"
+        return res
+    deps = data.get("dependencies")
+    if isinstance(deps, dict) and pkg in deps:
+        deps.pop(pkg, None)
+        res["removed_dep"] = True
+    dsh = data.get("dsh")
+    profile_block = (dsh or {}).get("profile") if isinstance(dsh, dict) else None
+    if isinstance(profile_block, dict):
+        bundles = profile_block.get("bundles")
+        if isinstance(bundles, list) and pkg in bundles:
+            profile_block["bundles"] = [b for b in bundles if b != pkg]
+            res["removed_bundle"] = True
+    if not (res["removed_dep"] or res["removed_bundle"]):
+        return {"ok": True, "why": "清单里本来就没有这个包", "backup": "",
+                "removed_dep": False, "removed_bundle": False}
+    backup = _backup_file(manifest)
+    tmp = manifest.with_name(manifest.name + ".dsh-lanes.tmp")
+    try:
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, manifest)
+    except OSError as exc:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        return {"ok": False, "why": str(exc), "backup": backup,
+                "removed_dep": res["removed_dep"], "removed_bundle": res["removed_bundle"]}
+    res.update({"ok": True, "why": "", "backup": backup})
+    return res
+
+
+def _pkg_name_from_spec(spec: str) -> str:
+    """从 `@scope/name@1.2.3` / `name@ver` 里抠出包名；非 registry 的 spec 返回空。"""
+    raw = (spec or "").strip()
+    if not raw or NON_REGISTRY_SPEC_RE.match(raw):
+        return ""
+    if raw.startswith("@"):
+        parts = raw.split("@", 2)
+        return f"@{parts[1]}" if len(parts) > 1 and parts[1] else ""
+    return raw.split("@", 1)[0]
+
+
+def add_plugin(cfg: dict, lane: str, profile: str, spec: str, timeout: int = 1800) -> dict:
+    """给某个 profile 装一个插件：dsh plugin add（离线优先）→ 登记依赖 + 组合包。
+
+    为什么不能只跑 pnpm：宿主按 `dsh.profile.bundles` 决定加载谁，**只装不登记不会生效**。
+    所以装完之后照 `transfer_plugins` 的规矩补两样：dependencies 与 bundles（bundle 形态才登）。
+    """
+    out = {"ok": False, "pkg": "", "version": "", "kind": "", "mode": "",
+           "tail": [], "merge": None, "error": "", "how": spec}
+    if lane not in cfg.get("lanes", {}):
+        out["error"] = f"没有 lane「{lane}」"
+        return out
+    try:
+        validate_profile_name(profile)
+    except ValueError as exc:
+        out["error"] = str(exc)
+        return out
+    spec = (spec or "").strip()
+    if not spec:
+        out["error"] = "没写要装什么（包名，可带版本号，如 @scope/name@1.2.3）"
+        return out
+    home = lane_home(cfg, lane)
+    pdir = profile_dir(home, profile)
+    does_not_exist = not pdir.is_dir()
+    if does_not_exist:
+        out["error"] = (f"profile「{lane}/{profile}」在磁盘上还不存在 —— "
+                        "请先用 profile-add 或 plugin-transfer 建它")
+        return out
+    before_deps = set(profile_dependencies(home, profile))
+    guess = _pkg_name_from_spec(spec)
+    non_registry = bool(NON_REGISTRY_SPEC_RE.match(spec))
+    res = plugin_add_smart(cfg, lane, profile, spec, label="plugin-add",
+                           timeout=timeout, non_registry=non_registry)
+    out["mode"] = res.get("mode", "")
+    out["tail"] = list(res.get("tail") or [])[-10:]
+    if not res.get("ok"):
+        out["error"] = (f"装不上（退出码 {res.get('rc')}"
+                        f"{'：' + res['error'] if res.get('error') else ''}）")
+        return out
+    # 认包名：registry spec 能直接抠出来；git/file 之类的靠装前装后的依赖差找新键
+    pkg = ""
+    if guess and installed_pkg_dir(home, guess, profile).is_dir():
+        pkg = guess
+    if not pkg:
+        fresh = [k for k in profile_dependencies(home, profile) if k not in before_deps]
+        if len(fresh) == 1:
+            pkg = fresh[0]
+        elif fresh:
+            pkg = guess if guess in fresh else sorted(fresh)[0]
+    if not pkg or not installed_pkg_dir(home, pkg, profile).is_dir():
+        out["error"] = ("装完了，但认不出装了哪个包（依赖清单里没多出新条目）—— "
+                        f"请用 plugins {lane} --profile {profile} 看一眼")
+        return out
+    version = installed_pkg_version(home, pkg, profile) or ""
+    manifest = package_manifest(home, pkg, profile)
+    dsh_block = manifest.get("dsh") or {}
+    rows = bundle_row_ids(home, pkg, profile)
+    kind = package_kind(home, pkg, rows, profile)
+    # 登记：包是不是组合包由它自己的 dsh.bundle 说了算（有才登记进 bundles）
+    bundles = [pkg] if dsh_block.get("bundle") else []
+    merge = _merge_profile_manifest(pdir, {}, bundles)
+    out.update({"ok": True, "pkg": pkg, "version": version, "kind": kind,
+                "rows": rows, "merge": merge, "bundles": bundles})
+    if not merge.get("ok"):
+        out["error"] = f"装上了，但登记失败：{merge.get('why')}"
+    return out
+
+
+def remove_plugin(cfg: dict, lane: str, profile: str, pkg: str,
+                  timeout: int = 1200, clean_rows: bool = False, verify: bool = True) -> dict:
+    """卸载一个插件：dsh plugin remove（pnpm）→ 摘掉依赖 + 组合包登记 → 清补丁行。
+
+    `clean_rows=True` 时顺带删掉补丁层里属于它的覆盖条目（默认**保留**：留着的坏覆盖不会报错，
+    只是静默失效，但删错了会破坏别的行——所以默认不动，交给用户显式选择）。
+    """
+    out = {"ok": False, "pkg": pkg, "rc": -1, "rows_cleaned": False, "merge": None,
+           "backup": "", "verify": "skip", "verify_why": "", "tail": [], "error": ""}
+    if lane not in cfg.get("lanes", {}):
+        out["error"] = f"没有 lane「{lane}」"
+        return out
+    try:
+        validate_profile_name(profile)
+    except ValueError as exc:
+        out["error"] = str(exc)
+        return out
+    pkg = (pkg or "").strip()
+    if not pkg:
+        out["error"] = "没写要卸哪个插件"
+        return out
+    if is_official_bundle(pkg):
+        out["error"] = f"{pkg} 是官方组合包，不能这样卸（会拆掉 DSH 自己的部件）"
+        return out
+    if is_protected_module(pkg):
+        out["error"] = f"{pkg} 属于宿主基础设施，禁止卸载（会破坏热加载/传输/存储链）"
+        return out
+    if pkg == MARKET_PKG:
+        out["error"] = f"{pkg}（插件市场）请用 market-off/市场页面处理，不要直接卸"
+        return out
+    home = lane_home(cfg, lane)
+    pdir = profile_dir(home, profile)
+    if not pdir.is_dir():
+        out["error"] = f"profile「{lane}/{profile}」在磁盘上不存在"
+        return out
+    if not installed_pkg_dir(home, pkg, profile).is_dir() and pkg not in profile_dependencies(home, profile):
+        out["ok"] = True
+        out["error"] = ""  # 本来就没装：不算失败
+        out["tail"] = ["（这个包本来就没装，什么都没做）"]
+        return out
+    rows = bundle_row_ids(home, pkg, profile)
+
+    res = run_plugin_cmd(cfg, lane, ["remove", pkg], timeout=timeout,
+                         label="plugin-rm", profile=profile)
+    out["rc"] = res["rc"]
+    out["tail"] = list(res.get("tail") or [])[-10:]
+    if not res.get("ok"):
+        out["error"] = (f"卸载失败（退出码 {res['rc']}"
+                        f"{'：' + res['error'] if res.get('error') else ''}）")
+        return out
+
+    merge = _unmerge_profile_manifest(pdir, pkg)
+    out["merge"] = merge
+    if not merge.get("ok"):
+        out["error"] = f"文件删了，但清单没改干净：{merge.get('why')}"
+
+    if clean_rows and rows:
+        patch_file = plugin_patch_path(cfg, lane, profile)
+        if patch_file.is_file():
+            text = patch_file.read_text(encoding="utf-8")
+            new_text = ensure_patch_array(remove_patch_row_entries(text, rows))
+            backup = _backup_file(patch_file)
+            wrote, why_write = write_patch_text(patch_file, new_text)
+            out["rows_cleaned"] = bool(wrote)
+            out["backup"] = backup
+            if not wrote:
+                out["error"] = out["error"] or f"补丁层清理失败：{why_write}"
+    out["ok"] = not out["error"]
+    if verify and out["ok"] and not clean_rows:
+        pass  # 没动补丁层就没什么可核对的
+    return out
+
+
+def cmd_plugin_add(cfg: dict, args) -> int:
+    """给某个 profile 加装一个插件（装 + 登记 bundles）。"""
+    lane = args.lane
+    prof = getattr(args, "profile", None) or PROFILE_NAME
+    spec = " ".join(getattr(args, "spec", []) or [])
+    info(col(f"── 加装插件：{lane}/{prof} ──", C.BOLD))
+    info(col(f"  {spec}（离线优先，缺包才联网）…", C.GRAY))
+    res = add_plugin(cfg, lane, prof, spec, timeout=int(getattr(args, "timeout", 1800) or 1800))
+    for line in res["tail"]:
+        info(col("      " + line, C.GRAY))
+    if not res["ok"]:
+        fail(f"  {res['error']}")
+        return 1
+    ok(f"  √ {res['pkg']} {res['version'] or ''}（{res['mode'] or '?'}）已装好")
+    if res["bundles"]:
+        ok(f"  已登记进 dsh.profile.bundles（宿主下次启动会加载它）")
+    if res.get("kind") == "client-only":
+        info(col("  纯客户端插件：补丁层没有它的行，开关在插件市场页面上。", C.GRAY))
+    if lane_runtime(cfg, lane, prof):
+        warn("  这条 profile 正在运行：重启它才会加载新插件")
+        info(col(f"      py {ME_NAME} stop {lane}/{prof} ； py {ME_NAME} open {lane}/{prof}", C.CYAN))
+    return 0
+
+
+def cmd_plugin_rm(cfg: dict, args) -> int:
+    """卸载某个 profile 里的一个插件（host 文件 + 清单登记一起清）。"""
+    lane = args.lane
+    prof = getattr(args, "profile", None) or PROFILE_NAME
+    targets = list(getattr(args, "target", []) or [])
+    if not targets:
+        fail("没写要卸哪个插件")
+        return 1
+    info(col(f"── 卸载插件：{lane}/{prof} ──", C.BOLD))
+    bad = 0
+    for target in targets:
+        listing = plugin_listing(cfg, lane, prof)
+        item, why = resolve_plugin_target(listing, target)
+        name = item["pkg"] if item else target
+        if item is None and not name:
+            fail(f"  × {target}：{why}")
+            bad += 1
+            continue
+        res = remove_plugin(cfg, lane, prof, name, timeout=int(getattr(args, "timeout", 1200) or 1200),
+                            clean_rows=bool(getattr(args, "clean_rows", False)))
+        for line in res["tail"]:
+            info(col("      " + line, C.GRAY))
+        if res["ok"]:
+            ok(f"  √ {name} 已卸载" + ("（顺带清了补丁行）" if res["rows_cleaned"] else ""))
+        else:
+            fail(f"  × {name}：{res['error']}")
+            bad += 1
+    if lane_runtime(cfg, lane, prof):
+        warn("  这条 profile 正在运行：重启它才会卸载生效")
+    return 1 if bad else 0
+
+
 def cmd_plugin_transfer(cfg: dict, args) -> int:
     """把插件从一个 profile 搬到另一个 profile / 另一个版本。"""
     lane = getattr(args, "lane", "") or ""
@@ -5731,29 +6962,6 @@ def cmd_plugin_transfer(cfg: dict, args) -> int:
     return 0 if res["ok"] else 1
 
 
-def cmd_plugins_write_disabled(cfg: dict, args) -> int:
-    """写补丁层来开关插件 —— 这个功能**已停用**（2026-09-27）。
-
-    为什么停用：用户日常那套 profile 的补丁层被写坏过一次，直接起不来：
-        YAMLException: duplicated mapping key (13:3)
-    根因是"按两行删条目"，而条目可以带 `config:` 后续行，剩下的部分落进上一条目形成重复键
-    （已本地复现，插件市场自己的 `parsePatchFile()` 判 REJECTED）。修好删除逻辑只是止血——
-    这条路还依赖"行 id 归属""宿主保护名单""纯客户端插件管不了"等一堆判断，风险与收益不成比例。
-    所以**写开关一律停用**，只保留只读清单；真要开关插件，用 DSH 自己的插件市场页面。
-    """
-    lane = getattr(args, "lane", "") or "<lane>"
-    me = ME_NAME
-    warn("「用启动器写补丁层来开关插件」已经停用（2026-09-27）。")
-    info(col("  原因：2026-09-27 11:00 那次开关把 profile 的补丁层写坏了，DSH 直接拒绝启动该 profile：", C.GRAY))
-    info(col("        YAMLException: duplicated mapping key (13:3)", C.GRAY))
-    info(col("  根因：条目不只两行（`- id: X` + `disabled:`），还可能带 `config:` 等后续行；", C.GRAY))
-    info(col("        只删前两行，剩下的 `config:` 会落进上一条目 → 同一个映射出现两个 config: 键。", C.GRAY))
-    info("")
-    info(col(f"  只想看状态（只读，安全）： py {me} plugins {lane}", C.CYAN))
-    info(col("  真要开关插件：用 DSH 自己的插件市场页面（它有自己的写法与保护）。", C.CYAN))
-    return 1
-
-
 def cmd_plugins(cfg: dict, args) -> int:
     """列出这条 lane 的插件格局：插件 → 真实行 id → 现在关没关，**谁能关它**。
 
@@ -5768,7 +6976,7 @@ def cmd_plugins(cfg: dict, args) -> int:
     listing = plugin_listing(cfg, lane, prof)
     me = ME_NAME
     info(col(f"── lane「{lane}」的插件开关（profile {listing['profile']}）──　"
-             "（只读；写开关已停用，见 README）", C.BOLD))
+             "（这里只读；开关用 plugin-off / plugin-on / plugins-off / plugins-on）", C.BOLD))
     info(f"  DSH_HOME : {listing['home']}")
     info(f"  补丁层   : {listing['patch_file']}"
          + ("（有一键禁用块）" if listing["has_block"] else "")
@@ -5822,8 +7030,11 @@ def cmd_plugins(cfg: dict, args) -> int:
              "这类覆盖**不会报错**，只是静默失效：")
         info(col("      " + "、".join(malformed), C.GRAY))
     info("")
-    info(col(f"  只读清单（写开关已停用）： py {me} plugins {lane}", C.CYAN))
-    info(col("  要开关插件：用 DSH 自己的插件市场页面", C.GRAY))
+    info(col(f"  开关单个插件： py {me} plugin-off {lane} <插件名> --profile {listing['profile']}"
+             f" ； py {me} plugin-on {lane} <插件名> --profile {listing['profile']}", C.CYAN))
+    info(col(f"  加装插件： py {me} plugin-add {lane} <包名> --profile {listing['profile']}"
+             f" ； 卸载： py {me} plugin-rm {lane} <插件名> --profile {listing['profile']}", C.CYAN))
+    info(col(f"  一键全关（可撤销）： py {me} plugins-off {lane} --profile {listing['profile']}", C.CYAN))
     if getattr(args, "dump", False):
         info("")
         info(col("  离线组合一次，核对文件与组合结果是否一致…", C.GRAY))
@@ -5867,7 +7078,8 @@ def cmd_plugin_switch(cfg: dict, args, want_on: bool) -> int:
     if lane not in cfg.get("lanes", {}):
         fail(f"没有 lane「{lane}」")
         return 1
-    listing = plugin_listing(cfg, lane)
+    prof = getattr(args, "profile", None) or PROFILE_NAME
+    listing = plugin_listing(cfg, lane, prof)
     item, why = resolve_plugin_target(listing, args.target)
     if item is None:
         fail(why)
@@ -5891,9 +7103,10 @@ def cmd_plugin_switch(cfg: dict, args, want_on: bool) -> int:
         if item["skipped"]:
             info(col("      （它启动时被跳过了：版本不兼容）", C.GRAY))
         return 1
-    running = lane_runtime(cfg, lane)
+    running = lane_runtime(cfg, lane, prof)
     changes = [(name, want_on)]
-    result = apply_plugin_states(cfg, lane, changes, force=bool(getattr(args, "force", False)))
+    result = apply_plugin_states(cfg, lane, changes, profile=prof,
+                                 force=bool(getattr(args, "force", False)))
     info("")
     if not result["ok"]:
         fail(result.get("error") or "写入失败")
@@ -5915,16 +7128,21 @@ def cmd_plugin_switch(cfg: dict, args, want_on: bool) -> int:
         return 0
     info("")
     info(col(f"  备份      {result.get('backup')}", C.GRAY))
+    verdict = result.get("verify")
+    if verdict == "ok":
+        ok(f"  自动校验：{result.get('verify_why')}")
+    elif verdict == "skip":
+        info(col(f"  自动校验跳过：{result.get('verify_why')}", C.GRAY))
     if running:
         ok(f"已写入。这条 lane 正在运行：补丁层是 DSH 热重载**正盯着**的文件（@deepseek-ai/dsh-hmr），"
            "不用重启——实测两个方向都是 ~2.3 秒生效。")
     else:
         info(col("这条 lane 没在运行：下次 open 时生效。想先核对组合结果： "
-                 f"py {me} plugins {lane} --dump", C.GRAY))
+                 f"py {me} plugins {lane} --profile {prof} --dump", C.GRAY))
     if getattr(args, "verify", False):
         info("")
         info(col("  离线组合一次核对…", C.GRAY))
-        dump = run_dump_config(cfg, lane)
+        dump = run_dump_config(cfg, lane, prof)
         if not dump.get("ok"):
             warn("组合检查没跑起来，改动是否生效未经验证")
             return 0
@@ -5989,8 +7207,9 @@ def cmd_plugins_off(cfg: dict, args) -> int:
     keep = set()
     for item in getattr(args, "keep", None) or []:
         keep.update(x.strip() for x in str(item).split(",") if x.strip())
+    prof = getattr(args, "profile", None) or PROFILE_NAME
 
-    patch_file = plugin_patch_path(cfg, lane)
+    patch_file = plugin_patch_path(cfg, lane, prof)
     if not patch_file.is_file():
         fail(f"找不到用户层补丁文件：{patch_file}")
         return 1
@@ -6006,13 +7225,13 @@ def cmd_plugins_off(cfg: dict, args) -> int:
             "（要连市场一起恢复，先 market-on）"
         )
 
-    if lane_runtime(cfg, lane):
+    if lane_runtime(cfg, lane, prof):
         info(col(f"lane「{lane}」正在运行：补丁层是 DSH 热重载盯着的文件，写进去大约 2 秒生效"
                  "（实测 2.3 秒），不用重启；只有启动冒烟跑不了——那条要停一次。", C.GRAY))
 
-    info(col(f"── 一键禁用第三方插件：lane「{lane}」──", C.BOLD))
+    info(col(f"── 一键禁用第三方插件：lane「{lane}」/ profile「{prof}」──", C.BOLD))
     info(col("  正在离线组合一次 profile（dsh --dump-config）拿真实行清单…", C.GRAY))
-    dump = run_dump_config(cfg, lane)
+    dump = run_dump_config(cfg, lane, prof)
     if not dump.get("ok"):
         fail(f"组合检查失败（{dump.get('error') or '退出码 ' + str(dump.get('rc'))}），为了不瞎写就不继续了")
         if dump.get("stderr"):
@@ -6020,7 +7239,7 @@ def cmd_plugins_off(cfg: dict, args) -> int:
                 info(col(f"      {line}", C.GRAY))
         return 1
     rows = dump["rows"]
-    targets, notes = _collect_targets(cfg, lane, keep, PROFILE_NAME, rows)
+    targets, notes = _collect_targets(cfg, lane, keep, prof, rows)
     if market_note:
         notes.append(market_note)
     if not targets:
@@ -6087,7 +7306,7 @@ def cmd_plugins_off(cfg: dict, args) -> int:
     if getattr(args, "no_verify", False):
         return 0
     info(col("  再组合一次，核对禁用到没到生效…", C.GRAY))
-    after = run_dump_config(cfg, lane)
+    after = run_dump_config(cfg, lane, prof)
     if not after.get("ok"):
         warn("复核没能跑起来，禁用的是否生效**未经验证**，建议手动打开这条 lane 看一眼")
         return 0
@@ -6100,7 +7319,7 @@ def cmd_plugins_off(cfg: dict, args) -> int:
         fail(f"有 {len(bad)} 个行写进去了但仍然是启用状态：{'、'.join(sorted(set(bad)))}")
     still = [
         item["pkg"]
-        for item in plugin_overview(cfg, lane, PROFILE_NAME, dump=after)["bundles"]
+        for item in plugin_overview(cfg, lane, prof, dump=after)["bundles"]
         if not item["official"] and item["present"] and len(item["disabled"]) != len(item["present"])
     ]
     if not dead and not bad:
@@ -6113,7 +7332,7 @@ def cmd_plugins_off(cfg: dict, args) -> int:
     # 所以这一步是默认开的；起不来就**自动撤销**，不留一个起不来的环境给你。
     if getattr(args, "no_boot_check", False):
         info(col("  （按你的要求跳过了启动冒烟）", C.GRAY))
-    elif lane_runtime(cfg, lane):
+    elif lane_runtime(cfg, lane, prof):
         info(col("  这条 lane 正在运行：补丁层已经热生效，跳过启动冒烟（那条要停一次才能跑）。"
                  "想连「下次启动能不能起来」一起验：先 stop 再跑一次。", C.GRAY))
     else:
@@ -6121,12 +7340,12 @@ def cmd_plugins_off(cfg: dict, args) -> int:
         rc = cmd_open(
             cfg,
             argparse.Namespace(
-                target=lane, port=None, cwd=None, timeout=90,
+                target=f"{lane}/{prof}", port=None, cwd=None, timeout=90,
                 no_browser=True, detach=True, adopt_only=False,
             ),
         )
         if rc == 0:
-            cmd_stop(cfg, argparse.Namespace(target=[lane]))
+            cmd_stop(cfg, argparse.Namespace(target=[f"{lane}/{prof}"]))
             ok("启动冒烟通过（已把它停回去）")
         else:
             problems = True
@@ -6140,11 +7359,11 @@ def cmd_plugins_off(cfg: dict, args) -> int:
                  "（本机就是 @liustack/modsearch 插入的 `web` 行）。排除它再试：")
             info(col(f"      py {ME_NAME} plugins-off {lane} --keep @liustack/modsearch", C.CYAN))
     info("")
-    info(col(f"  撤销： py {ME_NAME} plugins-on {lane}", C.CYAN))
-    if lane_runtime(cfg, lane):
+    info(col(f"  撤销： py {ME_NAME} plugins-on {lane} --profile {prof}", C.CYAN))
+    if lane_runtime(cfg, lane, prof):
         info(col("  生效： 已经热生效了（这条 lane 正在运行，补丁层是热重载盯着的文件）", C.CYAN))
     else:
-        info(col(f"  生效： py {ME_NAME} open {lane}（下次启动时应用）", C.CYAN))
+        info(col(f"  生效： py {ME_NAME} open {lane}/{prof}（下次启动时应用）", C.CYAN))
     return 1 if problems else 0
 
 
@@ -6154,7 +7373,8 @@ def cmd_plugins_on(cfg: dict, args) -> int:
     if lane not in cfg.get("lanes", {}):
         fail(f"没有 lane「{lane}」")
         return 1
-    patch_file = plugin_patch_path(cfg, lane)
+    prof = getattr(args, "profile", None) or PROFILE_NAME
+    patch_file = plugin_patch_path(cfg, lane, prof)
     if not patch_file.is_file():
         fail(f"找不到用户层补丁文件：{patch_file}")
         return 1
@@ -6194,10 +7414,10 @@ def cmd_plugins_on(cfg: dict, args) -> int:
     ok(f"已撤销 lane「{lane}」的一键禁用（删掉 {span[1] - span[0] - 1} 行覆盖，你自己的配置没动）")
     if verdict:
         info(col(f"  校验：{verdict}", C.GRAY))
-    if lane_runtime(cfg, lane):
+    if lane_runtime(cfg, lane, prof):
         info(col("这条 lane 正在运行：删掉的那几行会被热重载立刻重放（不用重启）", C.GRAY))
     if not getattr(args, "no_verify", False):
-        listing = plugin_listing(cfg, lane)
+        listing = plugin_listing(cfg, lane, prof)
         enabled = [
             i["pkg"] for i in listing["bundles"]
             if not i["official"] and i["kind"] == "bundle" and not i["disabled_rows"]
@@ -9291,6 +10511,42 @@ def build_parser() -> argparse.ArgumentParser:
         "keys", help="列出一条 lane 的凭据条目（.credentials.yaml refs 段，即各提供商的 key）"
     )
     p_keys.add_argument("lane")
+    p_keys.add_argument("--show", action="store_true",
+                        help="把明文密钥也打出来（只在本机看：终端历史、日志里都别留）")
+
+    p_set_key = sub.add_parser(
+        "set-key", help="改 / 加一条凭据（写后用 dsh 自己的解析器校验，不过自动回滚）"
+    )
+    p_set_key.add_argument("lane")
+    p_set_key.add_argument("name", help="条目名，如 MY_API_KEY（字母/数字/_.-）")
+    p_set_key.add_argument("--value", metavar="V", help="明文值（会进命令行历史，慎用）")
+    p_set_key.add_argument("--from-env", metavar="ENV",
+                           help="从环境变量取值（推荐：不在历史里留明文）")
+
+    p_rm_key = sub.add_parser("rm-key", help="删掉一条 / 几条凭据条目")
+    p_rm_key.add_argument("lane")
+    p_rm_key.add_argument("names", nargs="+", help="条目名（可写多个，或逗号分隔）")
+
+    p_provider_list = sub.add_parser(
+        "provider-list", help="列出一个 profile 补丁层里手写的自定义服务商"
+    )
+    p_provider_list.add_argument("lane")
+    p_provider_list.add_argument("--profile", help=f"环境名（缺省 {PROFILE_NAME}）")
+
+    p_provider_add = sub.add_parser(
+        "provider-add", help="写一个自定义服务商进补丁层（写 dsh「设置 → 模型」的同一处）"
+    )
+    p_provider_add.add_argument("lane")
+    p_provider_add.add_argument("route", help="服务商短名，如 my-gateway（小写字母/数字/中划线）")
+    p_provider_add.add_argument("--api", required=True,
+                                help="协议：" + " / ".join(PROVIDER_APIS))
+    p_provider_add.add_argument("--base-url", help="接口地址，如 https://api.example.com/v1")
+    p_provider_add.add_argument("--display", help="在 dsh 里显示的名字")
+    p_provider_add.add_argument("--key", help="API key（会写进凭据 refs，条目名 <ROUTE>_API_KEY）")
+    p_provider_add.add_argument("--model", help="模型 id，逗号分隔（如 m-1,m-2）")
+    p_provider_add.add_argument("--profile", help=f"环境名（缺省 {PROFILE_NAME}）")
+    p_provider_add.add_argument("--overwrite", action="store_true",
+                                help="覆盖已存在的同名 route（默认拒绝，怕冲掉调好的东西）")
 
     p_copy_key = sub.add_parser(
         "copy-key", help="在 lane 之间按条目复制 API key：--only 挑条目，缺省全部"
@@ -9380,6 +10636,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_plugin_off.add_argument("lane")
     p_plugin_off.add_argument("target", help="插件名 / 行 id / 名字的一部分")
+    p_plugin_off.add_argument("--profile", help="哪个 profile（默认 web）")
     p_plugin_off.add_argument("--verify", action="store_true", help="写完额外离线组合一次核对")
 
     p_plugin_on = sub.add_parser(
@@ -9387,14 +10644,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_plugin_on.add_argument("lane")
     p_plugin_on.add_argument("target", help="插件名 / 行 id / 名字的一部分")
+    p_plugin_on.add_argument("--profile", help="哪个 profile（默认 web）")
     p_plugin_on.add_argument("--force", action="store_true",
                              help="没有禁用条目时也写一条 disabled: false 强行打开（可能有副作用）")
     p_plugin_on.add_argument("--verify", action="store_true", help="写完额外离线组合一次核对")
+
+    p_plugin_add = sub.add_parser(
+        "plugin-add", help="给某个 profile 加装一个插件（装 + 登记进 dsh.profile.bundles）"
+    )
+    p_plugin_add.add_argument("lane")
+    p_plugin_add.add_argument("spec", nargs="+",
+                              help="包名（可带版本，如 @scope/name@1.2.3；也支持 github:/file: 等 spec）")
+    p_plugin_add.add_argument("--profile", help="哪个 profile（默认 web）")
+    p_plugin_add.add_argument("--timeout", type=int, default=1800, help="安装超时秒数")
+
+    p_plugin_rm = sub.add_parser(
+        "plugin-rm", help="卸载某个 profile 里的一个插件（host 文件 + 清单登记一起清）"
+    )
+    p_plugin_rm.add_argument("lane")
+    p_plugin_rm.add_argument("target", nargs="+", help="插件名 / 行 id / 名字的一部分")
+    p_plugin_rm.add_argument("--profile", help="哪个 profile（默认 web）")
+    p_plugin_rm.add_argument("--clean-rows", dest="clean_rows", action="store_true",
+                             help="连补丁层里属于它的覆盖条目也删掉（默认保留）")
+    p_plugin_rm.add_argument("--timeout", type=int, default=1200, help="卸载超时秒数")
 
     p_off = sub.add_parser(
         "plugins-off", help="一次关掉所有自己装的（第三方）插件；官方组合包不动，可 plugins-on 撤销"
     )
     p_off.add_argument("lane")
+    p_off.add_argument("--profile", help="哪个 profile（默认 web）")
     p_off.add_argument("--keep", action="append", help="保留某个组合包（可多次，也可逗号分隔）")
     p_off.add_argument("--no-verify", dest="no_verify", action="store_true", help="跳过写入后的组合复核")
     p_off.add_argument(
@@ -9406,6 +10684,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_on = sub.add_parser("plugins-on", help="撤销一键禁用（只删启动器写的那一段覆盖）")
     p_on.add_argument("lane")
+    p_on.add_argument("--profile", help="哪个 profile（默认 web）")
     p_on.add_argument("--no-verify", dest="no_verify", action="store_true", help="跳过撤销后的组合复核")
 
     p_market = sub.add_parser(
@@ -9581,6 +10860,10 @@ def main() -> int:
         "profile-add": cmd_profile_add,
         "profile-rm": cmd_profile_rm,
         "keys": cmd_keys,
+        "set-key": cmd_set_key,
+        "rm-key": cmd_rm_key,
+        "provider-list": cmd_provider_list,
+        "provider-add": cmd_provider_add,
         "copy-key": cmd_copy_key,
         "delete": cmd_delete,
         "clone": cmd_clone,
@@ -9588,10 +10871,12 @@ def main() -> int:
         "verify": cmd_verify,
         "plugins": cmd_plugins,
         "plugin-transfer": cmd_plugin_transfer,
-        "plugin-off": cmd_plugins_write_disabled,
-        "plugin-on": cmd_plugins_write_disabled,
-        "plugins-off": cmd_plugins_write_disabled,
-        "plugins-on": cmd_plugins_write_disabled,
+        "plugin-add": cmd_plugin_add,
+        "plugin-rm": cmd_plugin_rm,
+        "plugin-off": cmd_plugin_off,
+        "plugin-on": cmd_plugin_on,
+        "plugins-off": cmd_plugins_off,
+        "plugins-on": cmd_plugins_on,
         "market": cmd_market,
         "market-off": cmd_market_off,
         "market-on": cmd_market_on,

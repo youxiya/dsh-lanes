@@ -413,8 +413,10 @@ function buildCard(lane) {
   const row1 = el('div', 'row');
   row1.append(
     button('link', '凭据…', 'dlg-credentials'),
+    button('link', '服务商…', 'dlg-providers'),
     button('link', '插件…', 'dlg-plugins'),
     button('link', '插件市场…', 'dlg-market'),
+    button('link', '配置文件…', 'dlg-files'),
     button('link', '备份对话…', 'dlg-chat'),
     button('link', '配置备份…', 'dlg-cfg'),
   );
@@ -751,6 +753,8 @@ $('#lane-scroll').addEventListener('click', (event) => {
   const laneDialogs = {
     'add-profile': dlgAddProfile,
     'dlg-credentials': dlgCredentials,
+    'dlg-providers': dlgProviders,
+    'dlg-files': dlgFiles,
     'dlg-plugins': dlgPlugins,
     'dlg-market': dlgMarket,
     'dlg-chat': dlgChat,
@@ -1430,118 +1434,440 @@ function dlgCredentials(lane) {
 }
 
 function buildCredentials(ctl, lane, data) {
-  ctl.body.append(el('p', 'dlg-lead',
-    '每个 HOME 的 .credentials.yaml 里有一个 refs 段：一条 = 一个提供商的 key 引用。'
-    + '选一个源、勾选要的条目、选目标 lane —— 复制只合并这几条，其它内容一字不动。'));
-  ctl.body.append(noteLine(
-    '原文件会先备份成 .credentials.yaml.bak；目标正在运行时要重启才生效。', 'info'));
-
   const lanes = data.lanes && data.lanes.length ? data.lanes : [lane];
-  const srcSel = selectInput(lanes, lane);
-  const dstSel = selectInput(lanes, lane);
-  const twoCol = el('div', 'two-col');
-  twoCol.append(el('span', 'k', '源 lane'), srcSel, el('span', 'k', '目标 lane'), dstSel);
-  ctl.body.append(twoCol);
-
+  const laneSel = selectInput(lanes, lane);
   const info = el('p', 'field-note');
   const listBox = el('div', 'pick-list');
-  const varsByKey = new Map();
+  const state = { items: [] };
 
-  const btnAll = button('btn small', '全选');
-  const btnNone = button('btn small', '全不选');
-  const counter = el('span', 'field-note');
-  const bar = el('div', 'pick-bar');
-  bar.append(btnAll, btnNone, counter);
+  ctl.body.append(el('p', 'dlg-lead',
+    '每个 HOME 的 .credentials.yaml 里有一个 refs 段：一条 = 一个提供商 / 插件的 key 引用。'
+    + '这里能看每条是谁在用（dsh 里设的显示名）、点了才取明文值、直接改 / 删 / 新增，'
+    + '也能从别的 lane 重新导入（修坏掉的文件就走这条）。'));
+  ctl.body.append(noteLine(
+    '改之前会先备份成 .credentials.yaml.bak；写后用 DSH 自己的解析器校验，不过会自动回滚。', 'info'));
+  ctl.body.append(el('div', 'plug-head', el('span', 'field-label', 'LANE'), laneSel));
+  ctl.body.append(el('div', 'field-label', '条目'), listBox, info);
 
-  function updateBar() {
-    const picked = [...varsByKey.values()].filter((b) => b.get()).length;
-    setText(counter, `已勾选 ${picked} / ${varsByKey.size} 条`);
-    ctl.refreshFoot();
-  }
-
-  function renderKeys(keys, path, err) {
+  function render(items) {
     clear(listBox);
-    varsByKey.clear();
-    setText(info, path ? `来源：${path}` : '');
-    if (err) {
-      listBox.append(el('p', 'field-note err', err));
-      updateBar();
+    state.items = items || [];
+    setText(info, `共 ${state.items.length} 条`);
+    if (!state.items.length) {
+      listBox.append(el('p', 'field-note',
+        '这个 HOME 还没有凭据条目。可以在下面新增，或从别的 lane 导入。'));
       return;
     }
-    if (!keys.length) {
-      listBox.append(el('p', 'field-note warn',
-        `（源「${srcSel.value}」的 HOME 里还没有凭据条目 —— 先把它启动一次并填好 key）`));
-      updateBar();
-      return;
-    }
-    for (const key of keys) {
+    for (const item of state.items) {
       const row = el('div', 'pick-row');
-      const box = checkInput('', true);
       const main = el('div', 'pick-main');
-      main.append(el('div', 'pick-title', key));
-      row.append(box.node, main);
-      varsByKey.set(key, box);
+      const title = el('div', 'pick-title');
+      title.append(el('b', null, item.display || item.name));
+      title.append(el('span', 'ver', item.name));
+      const providers = item.providers || [];
+      if (providers.length) title.append(el('span', 'pill tag', providers.join('、')));
+      main.append(title);
+      const holder = el('div', 'pick-sub');
+      main.append(holder);
+      const editBtn = button('btn small', '显示 / 编辑');
+      editBtn.addEventListener('click', () => toggleEdit(holder, item));
+      const delBtn = button('btn small danger', '删除');
+      delBtn.addEventListener('click', async () => {
+        const yes = await confirmBox({
+          head: '删除凭据条目',
+          text: `删掉「${item.name}」？\n\n引用它的插件 / 服务商会失去密钥，可能要重新填。`,
+          ok: '删除',
+        });
+        if (!yes || ctl.closed) return;
+        try {
+          const res = await api('credential_del', { lane: laneSel.value, names: [item.name] });
+          if (!res.ok) { toast(res.error || '删除失败', 'err', 5000); return; }
+          toast(`已删除 ${item.name}`, 'ok', 3000);
+          await load();
+        } catch (err) { toast('删除失败：' + err.message, 'err', 5000); }
+      });
+      const ops = el('div', 'pick-ops');
+      ops.append(editBtn, delBtn);
+      row.append(main, ops);
       listBox.append(row);
     }
-    updateBar();
   }
 
-  async function loadKeys() {
-    // 换源就重读一次条目（＝经典界面里 src_var 的 trace）
-    clear(listBox);
-    varsByKey.clear();
-    listBox.append(spinnerRow('正在读取…'));
-    setText(info, '');
-    updateBar();
+  async function toggleEdit(holder, item) {
+    if (holder.dataset.open === '1') { holder.dataset.open = '0'; clear(holder); return; }
+    clear(holder);
+    holder.dataset.open = '1';
+    holder.append(spinnerRow('正在取明文值…'));
+    let value = '';
     try {
-      const res = await api('credentials', { lane: srcSel.value });
+      const res = await api('credential_get', { lane: laneSel.value, name: item.name });
       if (ctl.closed) return;
-      renderKeys(res.keys || [], res.path, '');
+      if (!res.ok) {
+        clear(holder);
+        holder.append(el('div', 'field-note err', res.error || '取不到值'));
+        return;
+      }
+      value = res.value || '';
+    } catch (err) {
+      clear(holder);
+      holder.append(el('div', 'field-note err', '取不到值：' + err.message));
+      return;
+    }
+    clear(holder);
+    const input = textInput(value, '（空）');
+    input.classList.add('grow');
+    const save = button('btn small primary', '保存');
+    save.addEventListener('click', async () => {
+      try {
+        const res = await api('credential_set',
+          { lane: laneSel.value, name: item.name, value: input.value });
+        if (!res.ok) { toast(res.error || '保存失败', 'err', 6000); return; }
+        toast(`已保存 ${item.name}`, 'ok', 3000);
+        holder.dataset.open = '0';
+        clear(holder);
+      } catch (err) { toast('保存失败：' + err.message, 'err', 6000); }
+    });
+    const cancel = button('btn small', '收起');
+    cancel.addEventListener('click', () => { holder.dataset.open = '0'; clear(holder); });
+    const ops = el('div', 'pick-ops');
+    ops.append(save, cancel);
+    holder.append(input, ops);
+  }
+
+  async function load() {
+    clear(listBox);
+    listBox.append(spinnerRow('正在读取…'));
+    updateCopySources(lanes, laneSel.value);
+    try {
+      const res = await api('credentials', { lane: laneSel.value });
+      if (ctl.closed) return;
+      render(res.items || (res.keys || []).map((k) => ({ name: k })));
     } catch (err) {
       if (ctl.closed) return;
-      renderKeys([], '', `读取失败：${err.message}`);
+      clear(listBox);
+      listBox.append(el('p', 'field-note err', '读取失败：' + err.message));
+      setText(info, '');
     }
   }
 
-  btnAll.addEventListener('click', () => {
-    for (const box of varsByKey.values()) box.set(true);
-    updateBar();
-  });
-  btnNone.addEventListener('click', () => {
-    for (const box of varsByKey.values()) box.set(false);
-    updateBar();
-  });
-  listBox.addEventListener('change', updateBar);
-  srcSel.addEventListener('change', () => loadKeys());
+  laneSel.addEventListener('change', load);
 
-  ctl.body.append(el('div', 'field-label', '勾选要复制的条目（提供商）'), listBox, bar, info);
-  renderKeys(data.keys || [], data.path, '');
+  const newName = textInput('', 'MY_API_KEY');
+  const newValue = textInput('', 'sk-...');
+  const addBtn = button('btn small primary', '新增 / 覆盖');
+  addBtn.addEventListener('click', async () => {
+    const name = (newName.value || '').trim();
+    if (!name) { toast('先填条目名', 'err', 3000); return; }
+    try {
+      const res = await api('credential_set',
+        { lane: laneSel.value, name, value: newValue.value || '' });
+      if (!res.ok) { toast(res.error || '写入失败', 'err', 6000); return; }
+      toast(`已写入 ${name}`, 'ok', 3000);
+      newName.value = '';
+      newValue.value = '';
+      await load();
+    } catch (err) { toast('写入失败：' + err.message, 'err', 6000); }
+  });
+  const addRow = el('div', 'two-col');
+  addRow.append(el('span', 'k', '条目名'), newName, el('span', 'k', '值'), newValue);
+  ctl.body.append(el('div', 'field-label', '新增 / 覆盖一个条目'), addRow,
+    el('div', 'pick-bar', addBtn));
 
-  ctl.setFoot([
-    { text: '关闭', act: (c) => c.close() },
-    {
-      text: '复制选中的条目',
-      kind: 'primary',
-      enabled: () => [...varsByKey.values()].some((b) => b.get()),
-      act: async (c) => {
-        const src = srcSel.value;
-        const dst = dstSel.value;
-        if (src === dst) { toast('源和目标是同一条 lane', 'err', 4200); return; }
-        const picked = [...varsByKey.entries()].filter(([, b]) => b.get()).map(([k]) => k);
-        if (!picked.length) { toast('至少勾选一个条目（或换一个源）', 'err', 4200); return; }
-        const yes = await confirmBox({
-          head: '复制凭据',
-          text: `把「${src}」的 ${picked.length} 个条目复制给「${dst}」？\n\n`
-            + `　${picked.join('、')}\n\n`
-            + '只合并这几条 refs；目标的会话、设置、插件不受影响。',
-          ok: '复制',
-        });
-        if (!yes || c.closed) return;
-        startJob(c, `复制凭据 ${src} → ${dst}`, 'copy_key',
-          { source: src, dest: dst, only: picked });
-      },
-    },
-  ]);
+  const srcSel = selectInput(lanes, laneSel.value);
+  const impBtn = button('btn small', '从这条 lane 导入');
+  impBtn.addEventListener('click', async () => {
+    if (srcSel.value === laneSel.value) { toast('源和目标不能是同一条 lane', 'err', 3600); return; }
+    const yes = await confirmBox({
+      head: '导入凭据',
+      text: `把「${srcSel.value}」的全部凭据条目合并进「${laneSel.value}」？\n\n`
+        + '同名的覆盖、其余保留；改之前先备份。',
+      ok: '导入',
+    });
+    if (!yes || ctl.closed) return;
+    try {
+      const res = await api('credential_import', { lane: laneSel.value, source: srcSel.value });
+      if (!res.ok) { toast(res.error || '导入失败', 'err', 7000); return; }
+      const kept = (res.kept || []).length;
+      toast(`导入了 ${(res.imported || []).length} 条`
+        + (res.rebuilt ? '（refs 段整段重铺）' : '')
+        + (kept ? `，保留目标里原有的 ${kept} 条` : ''), 'ok', 4200);
+      await load();
+    } catch (err) { toast('导入失败：' + err.message, 'err', 7000); }
+  });
+  ctl.body.append(el('div', 'field-label', '修复 / 迁移（从别的 lane 导入）'),
+    el('div', 'plug-head', srcSel, impBtn),
+    noteLine('修坏掉的凭据文件就走这条：从一份好的 HOME 里重新导入。', 'muted'));
+
+  const copyInfo = el('p', 'field-note');
+  const copySrc = selectInput(lanes, lane === lanes[0] && lanes[1] ? lanes[1] : lane);
+  const copyDst = selectInput(lanes, lane);
+  const copyBtn = button('btn small primary', '复制全部条目');
+  copyBtn.addEventListener('click', async () => {
+    const from = copySrc.value;
+    const to = copyDst.value;
+    if (from === to) { toast('源和目标是同一条 lane', 'err', 3600); return; }
+    const yes = await confirmBox({
+      head: '复制凭据',
+      text: `把「${from}」的全部凭据条目复制给「${to}」？\n\n同名的覆盖、其余保留。`,
+      ok: '复制',
+    });
+    if (!yes || ctl.closed) return;
+    startJob(ctl, `复制凭据 ${from} → ${to}`, 'copy_key',
+      { source: from, dest: to, only: '*' });
+  });
+  function updateCopySources(_lanes, current) {
+    // 源下拉默认挑一条 ≠ 当前的 lane
+    if (copySrc.value === current) {
+      const other = lanes.find((n) => n !== current);
+      if (other) copySrc.value = other;
+    }
+    setText(copyInfo, `当前管理：${current}`);
+  }
+  const copyRow = el('div', 'two-col');
+  copyRow.append(el('span', 'k', '源 lane'), copySrc, el('span', 'k', '目标 lane'), copyDst);
+  ctl.body.append(el('div', 'field-label', '整份复制到别的 lane'), copyRow,
+    el('div', 'pick-bar', copyBtn, copyInfo));
+
+  ctl.setFoot([{ text: '关闭', act: (c) => c.close() }]);
+  load();
+}
+
+/* ── ④b 自定义服务商（写 profile 补丁层 → llm-pi-ai） ───────────────────── */
+
+function dlgProviders(lane) {
+  const ctl = openDialog({
+    head: `自定义服务商 · lane「${lane}」`,
+    size: 'lg',
+    build: (c) => { c.body.append(spinnerRow('正在读取服务商…')); },
+    foot: [{ text: '关闭', act: (c) => c.close() }],
+  });
+  loadDialog(ctl, '读取自定义服务商', 'provider_list', { lane },
+    (data) => buildProviders(ctl, lane, data));
+  return ctl;
+}
+
+function buildProviders(ctl, lane, data) {
+  const profiles = (data.profiles || []).map((p) => ({
+    value: p.name, label: p.name + (p.onDisk ? '' : '（未建）'),
+  }));
+  const profSel = selectInput(profiles.length ? profiles : [core_default_profile(lane)],
+    data.profile);
+  const apis = data.apis && data.apis.length ? data.apis
+    : ['openai-completions', 'openai-responses', 'anthropic-messages'];
+  const listBox = el('div', 'pick-list');
+  const info = el('p', 'field-note');
+  const state = { providers: [] };
+
+  ctl.body.append(el('p', 'dlg-lead',
+    '这里列的是这个 profile 补丁层（cordis.patch.yml）里手写的服务商 —— 就是 dsh「设置 → 模型」里'
+    + '显示的那些。新增一条会写进 llm-pi-ai 的 providers，并把 API key 存进 .credentials.yaml。'));
+  ctl.body.append(noteLine(
+    'route 只能小写字母 / 数字 / 中划线；keyRef 默认是 <ROUTE>_API_KEY（和 dsh 自己的规则一致）。',
+    'info'));
+  ctl.body.append(el('div', 'plug-head', el('span', 'field-label', 'PROFILE'), profSel));
+  ctl.body.append(el('div', 'field-label', '已有服务商'), listBox, info);
+
+  function render(providers, error) {
+    clear(listBox);
+    state.providers = providers || [];
+    setText(info, error ? '' : `共 ${state.providers.length} 个`);
+    if (error) {
+      listBox.append(el('p', 'field-note err', '读取失败：' + error));
+      return;
+    }
+    if (!state.providers.length) {
+      listBox.append(el('p', 'field-note', '这个 profile 还没有手写服务商。'));
+      return;
+    }
+    for (const p of state.providers) {
+      const row = el('div', 'pick-row');
+      const main = el('div', 'pick-main');
+      const title = el('div', 'pick-title');
+      title.append(el('b', null, p.displayName || p.route));
+      title.append(el('span', 'ver', p.route));
+      if (p.api) title.append(el('span', 'pill tag', p.api));
+      main.append(title);
+      const sub = el('div', 'pick-sub');
+      const ref = p.apiKeyEnv || defaultKeyRef(p.route);
+      sub.append(el('div', null, 'keyRef：' + ref));
+      if (p.baseURL) sub.append(el('div', null, 'baseURL：' + p.baseURL));
+      if ((p.models || []).length) sub.append(el('div', null, 'models：' + p.models.join('、')));
+      main.append(sub);
+      row.append(main);
+      listBox.append(row);
+    }
+  }
+
+  async function load() {
+    clear(listBox);
+    listBox.append(spinnerRow('正在读取…'));
+    try {
+      const res = await api('provider_list', { lane, profile: profSel.value });
+      if (ctl.closed) return;
+      render(res.providers, res.error);
+    } catch (err) {
+      if (!ctl.closed) render([], err.message);
+    }
+  }
+  profSel.addEventListener('change', load);
+
+  const routeIn = textInput('', 'my-gateway');
+  const nameIn = textInput('', '（默认跟 route 一样）');
+  const apiSel = selectInput(apis, apis[0]);
+  const urlIn = textInput('', 'https://…/v1');
+  const keyIn = textInput('', 'sk-...（可留空）');
+  const modelsIn = textInput('', 'model-a, model-b（逗号分隔）');
+  const addGrid = el('div', 'two-col');
+  addGrid.append(
+    el('span', 'k', 'route'), routeIn,
+    el('span', 'k', '显示名'), nameIn,
+    el('span', 'k', '协议'), apiSel,
+    el('span', 'k', 'baseURL'), urlIn,
+    el('span', 'k', 'API key'), keyIn,
+    el('span', 'k', '模型'), modelsIn,
+  );
+  const addBtn = button('btn small primary', '写入服务商');
+  const overwriteBox = checkInput('允许覆盖已存在的同名 route', false);
+  addBtn.addEventListener('click', async () => {
+    const route = (routeIn.value || '').trim();
+    if (!route) { toast('先填 route（小写字母 / 数字 / 中划线）', 'err', 4200); return; }
+    const models = (modelsIn.value || '').split(',').map((s) => s.trim()).filter(Boolean);
+    const yes = await confirmBox({
+      head: '写入自定义服务商',
+      text: `把「${route}」写进 ${lane}/${profSel.value} 的补丁层？\n\n`
+        + '会改 cordis.patch.yml（先备份 .bak），key 会存进 .credentials.yaml 的 '
+        + `${defaultKeyRef(route)}。`,
+      ok: '写入',
+    });
+    if (!yes || ctl.closed) return;
+    try {
+      const res = await api('provider_add', {
+        lane, profile: profSel.value, route,
+        displayName: (nameIn.value || '').trim(), api: apiSel.value,
+        baseURL: (urlIn.value || '').trim(), apiKey: keyIn.value || '', models,
+        overwrite: overwriteBox.get(),
+      });
+      if (!res.ok) { toast(res.error || '写入失败', 'err', 7000); return; }
+      const what = { added: '新增', replaced: '覆盖更新', none: '文件没变', refused: '被拒绝' };
+      toast(`${route}：${what[res.action] || res.action || '写完'}`,
+        res.action === 'none' ? 'warn' : 'ok', 3600);
+      if (res.action === 'added' || res.action === 'replaced') {
+        routeIn.value = '';
+        nameIn.value = '';
+        urlIn.value = '';
+        keyIn.value = '';
+        modelsIn.value = '';
+      }
+      await load();
+    } catch (err) { toast('写入失败：' + err.message, 'err', 7000); }
+  });
+  ctl.body.append(el('div', 'field-label', '新增 / 更新一个服务商'), addGrid,
+    el('div', 'pick-bar', addBtn, overwriteBox));
+
+  load();
+}
+
+/** dsh 自己的 keyRef 规则：route → UPPER_SNAKE + _API_KEY */
+function defaultKeyRef(route) {
+  return String(route || '').toUpperCase().replace(/[^A-Z0-9]+/g, '_') + '_API_KEY';
+}
+
+/* ── ④c 配置文件查看（需求③：打开 / 看内容 / 定位） ─────────────────────── */
+
+const CONFIG_KINDS = [
+  ['patch', 'cordis.patch.yml', '插件补丁层（开关 / 服务商 / 路由都在这）'],
+  ['credentials', '.credentials.yaml', '凭据（refs 段）'],
+  ['package', 'package.json', '这个 profile 的依赖与 dsh.profile.bundles'],
+  ['lock', 'pnpm-lock.yaml', '实际装上的版本账本'],
+  ['workspace', 'pnpm-workspace.yaml', 'pnpm 工作区设置'],
+  ['modules', 'node_modules/.modules.yaml', 'node_modules 布局（软链 / 隔离）'],
+];
+
+function dlgFiles(lane) {
+  const ctl = openDialog({
+    head: `配置文件 · lane「${lane}」`,
+    size: 'lg',
+    build: (c) => { c.body.append(spinnerRow('正在准备…')); },
+    foot: [{ text: '关闭', act: (c) => c.close() }],
+  });
+  api('lane_profiles', { lane }).then((data) => {
+    if (ctl.closed) return;
+    clear(ctl.body);
+    buildFiles(ctl, lane, data);
+  }).catch((err) => {
+    if (ctl.closed) return;
+    clear(ctl.body);
+    buildFiles(ctl, lane, { profiles: [], error: err.message });
+  });
+  return ctl;
+}
+
+function buildFiles(ctl, lane, data) {
+  const profiles = (data.profiles || []).map((p) => p.name);
+  const profSel = selectInput(profiles.length ? profiles : [core_default_profile(lane)],
+    core_default_profile(lane));
+  const cur = { which: 'patch' };
+  const pathLine = el('p', 'field-note');
+  const pre = el('pre', 'preview file-pre');
+  const openBtn = button('btn small', '在资源管理器里定位');
+  openBtn.addEventListener('click', () => openWhich(ctl, lane, profSel.value, cur.which));
+  const reloadBtn = button('btn small', '重新读取');
+
+  ctl.body.append(el('p', 'dlg-lead',
+    '直接看 dsh 自己的配置文件：改之前先看一眼、或者点「在资源管理器里定位」用记事本 / VSCode 改。'
+    + '本工具写这些文件时会先留 .bak，所以看花眼了也能还原。'));
+  ctl.body.append(el('div', 'plug-head', el('span', 'field-label', 'PROFILE'), profSel,
+    reloadBtn, openBtn));
+
+  const kinds = el('div', 'pick-bar');
+  const kindBtns = new Map();
+  for (const [key, label, note] of CONFIG_KINDS) {
+    const btn = button('btn small', label);
+    btn.title = note;
+    btn.addEventListener('click', () => { cur.which = key; markKind(); load(); });
+    kindBtns.set(key, btn);
+    kinds.append(btn);
+  }
+  function markKind() {
+    for (const [key, btn] of kindBtns) setClass(btn, 'primary', key === cur.which);
+  }
+  ctl.body.append(kinds, pathLine, pre);
+  reloadBtn.addEventListener('click', load);
+  profSel.addEventListener('change', load);
+
+  async function load() {
+    markKind();
+    clear(pre);
+    pathLine.classList.remove('err');
+    setText(pathLine, '正在读取…');
+    try {
+      const res = await api('file_view', { lane, profile: profSel.value, which: cur.which });
+      if (ctl.closed) return;
+      if (!res.ok) {
+        setText(pathLine, res.error || '读取失败');
+        pathLine.classList.add('err');
+        return;
+      }
+      setText(pathLine, `${res.path}　（${res.bytes} 字节`
+        + (res.clipped ? '，已截断显示' : '') + '）');
+      pre.textContent = res.text || '（空文件）';
+    } catch (err) {
+      setText(pathLine, '读取失败：' + err.message);
+      pathLine.classList.add('err');
+    }
+  }
+
+  load();
+}
+
+async function openWhich(ctl, lane, profile, which) {
+  try {
+    const res = await api('open_path', { which: 'file', key: which, lane, profile });
+    if (res && res.error) toast(res.error, 'warn', 4200);
+    else toast('已定位到文件', 'ok', 2400);
+  } catch (err) {
+    toast('打不开：' + err.message, 'err', 4200);
+  }
 }
 
 /* ── ④ 插件库（读取已装插件 · 跨 profile / 跨版本搬运） ─────────────────── */
@@ -1637,11 +1963,54 @@ function buildPluginUI(ctl, srcLane, srcProfile) {
       main.append(title);
       main.append(el('div', 'pick-sub', '行 id：' + (rows.join('、') || '（无）')));
       row.append(box.node, main);
+
+      // 就地开关 / 卸载（需求②：启动器页面直接管插件，不用去 dsh 里点）
+      const ops = el('div', 'pick-ops');
+      const fullyDisabled = rows.length > 0 && disabledRows.length === rows.length;
+      if (rows.length && !item.protected) {
+        const tg = button('btn small', fullyDisabled ? '启用' : '禁用');
+        tg.addEventListener('click', () => setPluginState(item, !fullyDisabled));
+        ops.append(tg);
+      }
+      if (!item.protected && !item.official && item.pkg !== 'dshmarket') {
+        const rm = button('btn small danger', '卸载');
+        rm.addEventListener('click', () => removePkg(item));
+        ops.append(rm);
+      }
+      if (ops.children.length) row.append(ops);
       state.vars.set(item.pkg, box);
       pickList.append(row);
     }
     setText(status, `共 ${state.plugins.length} 个第三方插件`);
     ctl.refreshFoot();
+  }
+
+  /** 打开/关掉一个插件：后端写补丁层 + 宿主校验，不过会自动回滚 */
+  async function setPluginState(item, on) {
+    try {
+      const res = await api('plugin_state',
+        { lane: state.srcLane, profile: state.srcProfile, pkg: item.pkg, on });
+      if (!res.ok) { toast(res.error || '写入失败', 'err', 6000); return; }
+      if (res.rollback) {
+        toast(`${item.pkg} 的改动没过校验，已自动回滚（文件没变）`, 'warn', 6000);
+      } else {
+        toast(`${item.pkg} 已${on ? '启用' : '禁用'}`, 'ok', 3000);
+      }
+      await loadSource();
+    } catch (err) { toast('操作失败：' + err.message, 'err', 6000); }
+  }
+
+  async function removePkg(item) {
+    const yes = await confirmBox({
+      head: '卸载插件',
+      text: `从 ${state.srcLane}/${state.srcProfile} 卸载「${item.pkg}」？\n\n`
+        + '会删依赖、摘掉 dsh.profile.bundles 里的登记，并清掉补丁层里它的行。',
+      ok: '卸载',
+    });
+    if (!yes || ctl.closed) return;
+    startJob(ctl, `卸载插件 ${item.pkg}`, 'plugin_remove',
+      { lane: state.srcLane, profile: state.srcProfile, pkg: item.pkg, cleanRows: true },
+      { reload: () => loadSource() });
   }
 
   async function loadSource() {
@@ -1714,7 +2083,13 @@ function buildPluginUI(ctl, srcLane, srcProfile) {
     for (const item of plan.items) {
       let text = `· ${item.pkg}  ${item.version || '?'} → ${item.want}`;
       if (item.why) text += `   （${item.why}）`;
-      lines.push([text, item.version ? 'ok' : null]);
+      lines.push([text, item.action === 'skip' ? 'muted' : (item.version ? 'ok' : null)]);
+    }
+    const skipped = plan.items.filter((it) => it.action === 'skip');
+    if (skipped.length) {
+      lines.push(['', null]);
+      lines.push([`已自动过滤 ${skipped.length} 个：两边同版本 / 源里没真装上，不用搬。`,
+        'muted']);
     }
     for (const line of plan.warnings || []) lines.push([`注意  ${line}`, 'warn']);
     setPreview(lines);
@@ -1726,6 +2101,27 @@ function buildPluginUI(ctl, srcLane, srcProfile) {
   left.append(el('div', 'plug-head',
     el('span', 'field-label', '来源环境'), srcLaneSel, srcProfBox));
   left.append(pickList);
+
+  const specIn = textInput('', '包名或 @scope/name@1.2.3');
+  specIn.classList.add('grow');
+  const addBtn = button('btn small primary', '加装');
+  addBtn.addEventListener('click', async () => {
+    const spec = (specIn.value || '').trim();
+    if (!spec) { toast('先填包名（可带版本）', 'err', 3600); return; }
+    const yes = await confirmBox({
+      head: '加装插件',
+      text: `给 ${state.srcLane}/${state.srcProfile} 装「${spec}」？\n\n`
+        + '走 dsh 自己的 plugin add（pnpm），需要能连上源；装好后会登记进 dsh.profile.bundles。',
+      ok: '加装',
+    });
+    if (!yes || ctl.closed) return;
+    specIn.value = '';
+    startJob(ctl, `加装插件 ${spec}`, 'plugin_add',
+      { lane: state.srcLane, profile: state.srcProfile, spec },
+      { reload: () => loadSource() });
+  });
+  left.append(el('div', 'field-label', '加装插件（走 dsh 自己的 plugin add）'),
+    el('div', 'plug-head', specIn, addBtn));
 
   const right = el('div', 'plug-col');
   right.append(el('div', 'plug-head',
