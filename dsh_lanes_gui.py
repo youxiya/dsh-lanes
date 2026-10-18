@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import io
+import math
 import os
 import queue
 import re
@@ -39,25 +40,517 @@ import dsh_lanes as core  # noqa: E402
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 LANE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
 
-# ── 配色（对齐 DSH 的浅色观感）──────────────────────────────────────────────
-BG = "#F4F5F7"
-CARD = "#FFFFFF"
-BORDER = "#E3E5E9"
-TEXT = "#1F2328"
-MUTED = "#6B7280"
-ACCENT = "#4D6BFE"
-ACCENT_DK = "#3A56E0"
-GREEN = "#16A34A"
-GREEN_BG = "#E8F6EE"
-GRAY = "#9CA3AF"
-GRAY_BG = "#F0F1F3"
-RED = "#DC2626"
-RED_BG = "#FDECEC"
-AMBER = "#B45309"
-AMBER_BG = "#FEF3E2"
-
 FONT_UI = "Microsoft YaHei UI"
 FONT_MONO = "Consolas"
+
+# ── 主题 ────────────────────────────────────────────────────────────────────
+#
+# 观感目标："彩色模糊背景 + 半透明磨砂玻璃面板"。tkinter 没有系统级亚克力/模糊，
+# 所以这里是自己把它画出来：
+#
+#   · 背景是一张**极光渐变图**（几个柔和色斑叠在竖向渐变上），按窗口尺寸渲染成
+#     PhotoImage。渲染在后台线程做（半个窗口尺寸 + zoom(2)，肉眼看不出来块），
+#     算完再回主线程建图，所以拖动窗口时界面不卡。
+#   · 面板/卡片是**玻璃面板**：自己的背景 = 同一张图里"它所处的那一块"，
+#     按主题把它往面板底色上混（`surface_alpha`）。于是整块界面看着像一片磨砂玻璃
+#     盖在同一张彩色背景上——彩色不是各画各的，是同一张图的连续切面。
+#   · 圆角不是贴图，是 Canvas 上用平滑多边形画的（`round_rect`）；卡片还带一层软阴影。
+#
+# 为什么不做真·亚克力（DWM）：那需要把窗口的客户区变成"未绘制"区域，而 tkinter 的
+# 每个控件都会自己刷底色，做不到；强行上 `-transparentcolor` 还会让那块变成穿透点击。
+# 与其做半个、还挑系统版本，不如把"磨砂玻璃"这件事画准。
+
+THEMES: dict[str, dict] = {
+    "light": {
+        "label": "浅色",
+        "icon": "☀",
+        "bg": "#E8ECF6",
+        "panel": "#FBFCFE",
+        "card": "#FFFFFF",
+        "border": "#D7DDEA",
+        "border_soft": "#E9EDF5",
+        "text": "#141922",
+        "muted": "#59637A",
+        "faint": "#98A2B6",
+        "accent": "#4D6BFE",
+        "accent_dk": "#2F4BD8",
+        "accent_soft": "#E9EDFF",
+        "green": "#0E9F5B",
+        "green_bg": "#E2F6EB",
+        "gray": "#98A1B2",
+        "gray_bg": "#EEF1F6",
+        "red": "#D92D2D",
+        "red_bg": "#FDEAEA",
+        "amber": "#A05F0A",
+        "amber_bg": "#FCEFDC",
+        "input_bg": "#F6F8FD",
+        "log_bg": "#FAFBFE",
+        "shadow": "#8E97AC",
+        "btn_bg": "#EBEFF8",       # 次要按钮的底色：必须和面板底色拉开一点，
+        "btn_bg_on": "#DCE3F3",    # 否则按钮看着就是一行普通文字
+        "btn_fg": "#1D2536",
+        # 面板有多"实"：1＝完全不透（看不见背景色），0.85＝往面板底色里混 15% 的背景色
+        "card_alpha": 0.84,
+        "panel_alpha": 0.88,
+        "aurora": {
+            "top": (247, 249, 255),
+            "bottom": (228, 234, 250),
+            "blobs": [
+                (0.10, 0.06, 0.60, (108, 130, 255), 0.70),
+                (0.90, 0.04, 0.55, (120, 215, 255), 0.60),
+                (0.78, 0.90, 0.66, (180, 140, 255), 0.56),
+                (0.04, 0.94, 0.60, (255, 160, 210), 0.52),
+                (0.45, 0.46, 0.92, (255, 255, 255), 0.34),
+            ],
+        },
+    },
+    "dark": {
+        "label": "深色",
+        "icon": "☾",
+        "bg": "#0A0D16",
+        "panel": "#151A26",
+        "card": "#181E2B",
+        "border": "#2A3346",
+        "border_soft": "#212838",
+        "text": "#E8ECF5",
+        "muted": "#98A3B9",
+        "faint": "#67718A",
+        "accent": "#7E96FF",
+        "accent_dk": "#A3B4FF",
+        "accent_soft": "#1E2740",
+        "green": "#3FD68C",
+        "green_bg": "#122C21",
+        "gray": "#6C7690",
+        "gray_bg": "#1D2431",
+        "red": "#FF6B6B",
+        "red_bg": "#2E1618",
+        "amber": "#F0B45E",
+        "amber_bg": "#2C2314",
+        "input_bg": "#10151F",
+        "log_bg": "#0E121B",
+        "shadow": "#03050A",
+        "btn_bg": "#232B3E",
+        "btn_bg_on": "#313B52",
+        "btn_fg": "#E8ECF5",
+        "card_alpha": 0.86,
+        "panel_alpha": 0.89,
+        "aurora": {
+            "top": (14, 18, 30),
+            "bottom": (6, 9, 16),
+            "blobs": [
+                (0.10, 0.06, 0.60, (58, 82, 224), 0.62),
+                (0.90, 0.08, 0.55, (12, 132, 176), 0.52),
+                (0.78, 0.90, 0.66, (124, 58, 208), 0.56),
+                (0.06, 0.92, 0.60, (186, 40, 112), 0.42),
+                (0.44, 0.44, 0.92, (30, 40, 62), 0.42),
+            ],
+        },
+    },
+}
+
+# 这些名字被界面代码当**模块级全局**用（`bg=CARD` 之类），切主题时整体重新绑定，
+# 然后重建界面 —— 所以不要在 def 的默认参数里引用它们（那会在导入时被固定住）。
+BG = CARD = BORDER = BORDER_SOFT = TEXT = MUTED = FAINT = ""
+ACCENT = ACCENT_DK = ACCENT_SOFT = GREEN = GREEN_BG = GRAY = GRAY_BG = ""
+RED = RED_BG = AMBER = AMBER_BG = INPUT_BG = LOG_BG = PANEL = SHADOW = ""
+BTN_BG = BTN_BG_ON = BTN_FG = ""
+THEME_NAME = "light"
+THEME: dict = THEMES["light"]
+LIST_BG = "#FFFFFF"          # 极光图还没渲染出来时的兜底底色
+
+SHADOW_PAD = 4               # 卡片四周留给阴影的边距
+CARD_RADIUS = 10             # 卡片圆角
+PANEL_RADIUS = 14            # 大面板（顶栏 / 日志 / 状态栏）圆角
+GAP = 10                     # 卡片之间的缝（缝里露出的是背景，所以别设 0）
+LIST_PAD = 12                # 左栏内容两侧的留白（留白里露出的也是背景）
+
+
+def theme_of(name: str | None) -> str:
+    return name if name in THEMES else "light"
+
+
+def apply_theme(name: str, size: tuple[int, int] | None = None) -> None:
+    """把主题里的颜色绑到模块级全局上。界面必须在调用后**整体重建**才会生效。
+
+    `CARD` / `PANEL` 不是主题里写死的白/灰，而是**磨砂色**：主题底色混一点背景平均色。
+    这样面板看着像一片压在彩色背景上的毛玻璃；而"混多少"由 `card_alpha` 控制。
+    背景平均色按 `size` 算（默认当前窗口大小），所以在窗口拖动过程中颜色是稳定的。
+    """
+    global THEME_NAME, THEME, LIST_BG
+    global BG, CARD, BORDER, BORDER_SOFT, TEXT, MUTED, FAINT
+    global ACCENT, ACCENT_DK, ACCENT_SOFT, GREEN, GREEN_BG, GRAY, GRAY_BG
+    global RED, RED_BG, AMBER, AMBER_BG, INPUT_BG, LOG_BG, PANEL, SHADOW
+    global BTN_BG, BTN_BG_ON, BTN_FG
+    THEME_NAME = theme_of(name)
+    THEME = THEMES[THEME_NAME]
+    if size and size[0] > 40 and size[1] > 40:
+        BACKDROP.size = (int(size[0]), int(size[1]))
+    elif BACKDROP.size[0] <= 40:
+        BACKDROP.size = (1120, 760)
+    avg = BACKDROP.average(*BACKDROP.size)
+
+    BG = THEME["bg"]
+    PANEL = hex_of(mix_rgb(avg, THEME["panel"], THEME["panel_alpha"]))
+    CARD = hex_of(mix_rgb(avg, THEME["card"], THEME["card_alpha"]))
+    BORDER = THEME["border"]
+    BORDER_SOFT = THEME["border_soft"]
+    TEXT = THEME["text"]
+    MUTED = THEME["muted"]
+    FAINT = THEME["faint"]
+    ACCENT = THEME["accent"]
+    ACCENT_DK = THEME["accent_dk"]
+    ACCENT_SOFT = THEME["accent_soft"]
+    GREEN = THEME["green"]
+    GREEN_BG = THEME["green_bg"]
+    GRAY = THEME["gray"]
+    GRAY_BG = THEME["gray_bg"]
+    RED = THEME["red"]
+    RED_BG = THEME["red_bg"]
+    AMBER = THEME["amber"]
+    AMBER_BG = THEME["amber_bg"]
+    INPUT_BG = THEME["input_bg"]
+    LOG_BG = THEME["log_bg"]
+    SHADOW = THEME["shadow"]
+    BTN_BG = THEME["btn_bg"]
+    BTN_BG_ON = THEME["btn_bg_on"]
+    BTN_FG = THEME["btn_fg"]
+    LIST_BG = hex_of(avg)
+
+
+def hex_of(rgb) -> str:
+    return "#%02x%02x%02x" % (max(0, min(255, int(rgb[0]))),
+                              max(0, min(255, int(rgb[1]))),
+                              max(0, min(255, int(rgb[2]))))
+
+
+def rgb_of(color: str | tuple) -> tuple:
+    if isinstance(color, tuple):
+        return color
+    text = str(color).lstrip("#")
+    if len(text) == 3:
+        text = "".join(ch * 2 for ch in text)
+    try:
+        return (int(text[0:2], 16), int(text[2:4], 16), int(text[4:6], 16))
+    except ValueError:
+        return (255, 255, 255)
+
+
+def mix_rgb(a, b, t: float) -> tuple:
+    """把两个颜色按 t 混合（t＝0 取 a，1 取 b）。不接受 t 越界。"""
+    t = 0.0 if t < 0 else (1.0 if t > 1 else t)
+    av, bv = rgb_of(a), rgb_of(b)
+    return (av[0] + (bv[0] - av[0]) * t,
+            av[1] + (bv[1] - av[1]) * t,
+            av[2] + (bv[2] - av[2]) * t)
+
+
+def mix(a, b, t: float) -> str:
+    return hex_of(mix_rgb(a, b, t))
+
+
+def lighten(color, t: float) -> str:
+    return mix(color, "#ffffff", t)
+
+
+def darken(color, t: float) -> str:
+    return mix(color, "#000000", t)
+
+
+# ── 极光背景渲染 ────────────────────────────────────────────────────────────
+#
+# 只渲染**一张**原图，玻璃面板各自从它上面取色（见 Backdrop）。窗口 1120×760 按
+# 半分辨率算是 21 万像素，纯 Python 大概 0.2 秒 —— 放在后台线程做，主线程只管建
+# PhotoImage（几十毫秒），所以拖动窗口时界面不卡。
+
+def aurora_ppm(w: int, h: int, theme: dict) -> bytes:
+    """把极光渐变渲染成 PPM(P6) 字节。w/h 是**渲染分辨率**（不是最终显示尺寸）。"""
+    spec = theme["aurora"]
+    top, bottom = rgb_of(spec["top"]), rgb_of(spec["bottom"])
+    blobs = []
+    span = float(max(w, h))
+    for fx, fy, fr, color, strength in spec["blobs"]:
+        radius = max(8.0, fr * span)
+        blobs.append((fx * w, fy * h, radius * radius, rgb_of(color), strength))
+
+    buf = bytearray(b"P6\n%d %d\n255\n" % (w, h))
+    row = bytearray()
+    for y in range(h):
+        base_r, base_g, base_b = mix_rgb(top, bottom, y / max(1, h - 1))
+        active = []
+        for bx, by, br2, color, strength in blobs:
+            dy = y - by
+            d2y = dy * dy
+            if d2y < br2:                     # 这一行落在这个色斑范围内才逐像素算
+                active.append((bx, br2, d2y, color, strength))
+        del row[:]
+        if not active:
+            row += bytes((int(base_r), int(base_g), int(base_b))) * w
+        else:
+            for x in range(w):
+                r, g, b = base_r, base_g, base_b
+                for bx, br2, d2y, color, strength in active:
+                    dx = x - bx
+                    d2 = d2y + dx * dx
+                    if d2 >= br2:
+                        continue
+                    f = 1.0 - d2 / br2
+                    a = strength * f * f
+                    r += (color[0] - r) * a
+                    g += (color[1] - g) * a
+                    b += (color[2] - b) * a
+                row += bytes((int(r), int(g), int(b)))
+        buf += row
+    return bytes(buf)
+
+
+AURORA_SCALE = 2      # 半分辨率渲染 + zoom(2)：柔和渐变上相邻像素只差 1 级，看不出块
+
+
+class Backdrop:
+    """主背景（极光图）的持有者：一张图 + 一个"任意坐标取色"的解析函数。
+
+    玻璃面板就是拿它取色的：面板位置在哪，就取哪里的背景色，再按主题往面板底色上混。
+    这样整屏看着像**同一片磨砂玻璃**盖在同一张彩色背景上，而不是每块各调各的颜色。
+    """
+
+    def __init__(self) -> None:
+        self.photo: tk.PhotoImage | None = None
+        self.small: tk.PhotoImage | None = None
+        self.size: tuple[int, int] = (0, 0)
+        self.key: tuple | None = None
+
+    def color_at(self, x: float, y: float) -> str:
+        """按**逻辑窗口坐标**直接算背景色（不查图，所以滚动时也不会错位）。"""
+        spec = THEME["aurora"]
+        w, h = self.size
+        if w <= 0 or h <= 0:
+            return hex_of(spec["top"])
+        r, g, b = mix_rgb(spec["top"], spec["bottom"], y / max(1, h - 1))
+        span = float(max(w, h))
+        for fx, fy, fr, color, strength in spec["blobs"]:
+            radius = max(8.0, fr * span)
+            dx = x - fx * w
+            dy = y - fy * h
+            d2 = dx * dx + dy * dy
+            r2 = radius * radius
+            if d2 >= r2:
+                continue
+            f = 1.0 - d2 / r2
+            a = strength * f * f
+            cr, cg, cb = rgb_of(color)
+            r += (cr - r) * a
+            g += (cg - g) * a
+            b += (cb - b) * a
+        return hex_of((r, g, b))
+
+    def average(self, w: int, h: int, steps: int = 14) -> tuple:
+        """整屏背景的平均色（采样网格，够用且便宜）。磨砂面板的底色就是拿它调的。"""
+        if w <= 0 or h <= 0:
+            return rgb_of(THEME["aurora"]["top"])
+        total = [0.0, 0.0, 0.0]
+        weight = 0.0
+        for iy in range(steps):
+            y = (iy + 0.5) / steps * h
+            for ix in range(steps):
+                x = (ix + 0.5) / steps * w
+                col = rgb_of(self.color_at(x, y))
+                total[0] += col[0]
+                total[1] += col[1]
+                total[2] += col[2]
+                weight += 1.0
+        return (total[0] / weight, total[1] / weight, total[2] / weight)
+
+    def shadow(self, x: float, y: float, strength: float) -> str:
+        return hex_of(mix_rgb(self.color_at(x, y), "#000000", strength))
+
+
+BACKDROP = Backdrop()
+
+
+def round_rect(canvas: tk.Canvas, x1: float, y1: float, x2: float, y2: float,
+               r: float, **kwargs) -> int:
+    """在 Canvas 上画圆角矩形（真圆弧），返回 item id。
+
+    tkinter 没有圆角图元。**不要**用 `smooth=True` 那种"四角各点两下"的写法：Tk 的
+    平滑多边形是样条，曲线**不穿过**控制点，整块会被往里吸——直边中间凹进去一两个像素，
+    底下那层背景就从缝里漏出来，看着像卡片角上贴了个小方块（浅色主题是浅浅一条，
+    深色主题就是一个明显的黑块）。这里直接把圆弧采样成点、`smooth=False`，边界精确。
+    """
+    r = max(0.0, min(float(r), abs(x2 - x1) / 2.0, abs(y2 - y1) / 2.0))
+    steps = max(3, min(18, int(r)))
+    points: list[float] = []
+    for cx, cy, start, end in (
+        (x2 - r, y1 + r, -90.0, 0.0),     # 右上
+        (x2 - r, y2 - r, 0.0, 90.0),      # 右下
+        (x1 + r, y2 - r, 90.0, 180.0),    # 左下
+        (x1 + r, y1 + r, 180.0, 270.0),   # 左上
+    ):
+        if r <= 0:
+            points.extend([cx, cy])
+            continue
+        for index in range(steps + 1):
+            angle = math.radians(start + (end - start) * index / steps)
+            points.extend([cx + r * math.cos(angle), cy + r * math.sin(angle)])
+    return canvas.create_polygon(points, smooth=False, **kwargs)
+
+
+class GlassPanel(tk.Canvas):
+    """一块圆角磨砂玻璃：自带投影、圆角、1px 描边；内容装进 `self.body`。
+
+    两层背景，缺一层就不像玻璃：
+
+      1. **画布底**放的是主背景极光图（按本面板在窗口里的位置对齐）——
+         面板四个圆角外侧露出来的就是真实背景，和旁边无缝接上，
+         不会出现"圆角外面是一块方形的怪色"；
+      2. **圆角矩形**填的是磨砂色（主题底色混一点背景色，见 `apply_theme`）——
+         这就是"磨砂"那一层。
+
+    `pad` 必须 ≥ `radius`：内容框是方的，内缩不足就会把圆角盖掉。
+    """
+
+    def __init__(self, master, app, *, radius: int = 10, pad: int = 10,
+                 shadow: int = SHADOW_PAD, fill: str | None = "card",
+                 body_window: bool = True, stretch: bool = False) -> None:
+        super().__init__(master, highlightthickness=0, bd=0, bg=LIST_BG)
+        self.app = app
+        self.radius = int(radius)
+        self.pad = max(int(pad), self.radius)
+        self.shadow_pad = max(0, int(shadow))
+        # fill 用**标记字**而不是把 CARD/PANEL 当默认值：默认参数在"导入时"求值，
+        # 而颜色常量要等 apply_theme() 才有值 —— 写 CARD 会拿到空串，磨砂层直接画不出来。
+        self.fill = {"card": CARD, "panel": PANEL, "none": None}.get(fill, fill)
+        # stretch＝内容框跟着面板一起撑满（日志这种"面板多高内容就多高"的用它）；
+        # 不 stretch 的（卡片）反过来：面板高度由内容决定。
+        self.stretch = bool(stretch)
+        self.autoheight = bool(body_window) and not self.stretch
+        self.scroll_x = 0.0                  # 本面板自己会滚动时要减掉的偏移（见 _draw_bg_image）
+        self.scroll_y = 0.0
+        inset = self.shadow_pad + self.pad
+        self.body: tk.Frame | None = None
+        self._bg_item: int | None = None
+        self._shape: list[int] = []
+        self._win: int | None = None
+        self._height = 0
+        if body_window:
+            self.body = tk.Frame(self, bg=self.fill or LIST_BG)
+            self._win = self.create_window(inset, inset, anchor="nw", window=self.body)
+            self.body.bind("<Configure>", self._on_body)
+        self.bind("<Configure>", self._on_configure)
+        app.glass_panels.append(self)
+
+    # ── 几何 ───────────────────────────────────────────────────────────────
+    def _on_configure(self, event) -> None:
+        self.redraw()
+
+    def _on_body(self, event) -> None:
+        if not self.autoheight:
+            return
+        want = event.height + 2 * (self.shadow_pad + self.pad)
+        if want == self._height:
+            return
+        self._height = want
+        try:
+            self.configure(height=want)
+        except tk.TclError:
+            return
+
+    def _origin(self) -> tuple[float, float]:
+        """本面板左上角在**窗口坐标**里的位置（滚动的父画布也算进去）。"""
+        try:
+            return (self.winfo_rootx() - self.app.root.winfo_rootx(),
+                    self.winfo_rooty() - self.app.root.winfo_rooty())
+        except tk.TclError:
+            return (0.0, 0.0)
+
+    def redraw(self) -> None:
+        """按**当前实际尺寸**重排内嵌内容 + 重画底图/阴影/圆角/描边。
+
+        内容宽度这里每次重画都重设一遍，而不是只在 `<Configure>` 里设：那一次事件里的
+        `event.width` 可能是布局中途的值（窗口还在长），设大了内容就会溢出到面板外面
+        —— 实测表现为最右边那个按钮被面板边缘切掉一截。重画时按 winfo_width() 定尺寸，
+        不管中间发生过什么，最后一次重画总是对的。
+        """
+        try:
+            w, h = self.winfo_width(), self.winfo_height()
+        except tk.TclError:
+            return
+        if w <= 2 or h <= 2:
+            return
+        if self._win is not None:
+            try:
+                self.itemconfigure(self._win,
+                                   width=max(1, w - 2 * (self.shadow_pad + self.pad)),
+                                   height=max(1, h - 2 * (self.shadow_pad + self.pad))
+                                   if self.stretch else 0)
+            except tk.TclError:
+                return
+        ox, oy = self._origin()
+        self._draw_bg_image(ox, oy)
+        for item in self._shape:
+            try:
+                self.delete(item)
+            except tk.TclError:
+                pass
+        self._shape = []
+        ins = self.shadow_pad
+        if self.shadow_pad:
+            self._shape.append(round_rect(
+                self, ins, ins + 2, w - ins, h - ins + 3, self.radius,
+                fill=BACKDROP.shadow(ox + w / 2.0, oy + h / 2.0,
+                                     0.15 if THEME_NAME == "light" else 0.55),
+                outline=""))
+        if self.fill:
+            self._shape.append(round_rect(self, ins, ins, w - ins, h - ins, self.radius,
+                                          fill=self.fill, outline=""))
+        self._shape.append(round_rect(
+            self, ins, ins, w - ins, h - ins, self.radius, fill="",
+            outline=mix(self.fill or LIST_BG, BORDER, 0.85), width=1))
+        try:
+            if self._bg_item is not None:
+                self.tag_lower(self._bg_item)
+            for item in self._shape:
+                self.tag_raise(item)
+            if self._win is not None:
+                self.tag_raise(self._win)
+        except tk.TclError:
+            pass
+
+    def _draw_bg_image(self, ox: float, oy: float) -> None:
+        """把主背景图按本面板的位置摆好 —— 相当于"从大图上裁出自己这一块"。
+
+        canvas 坐标 (c) 显示在屏幕上的位置是 `c - scroll`，所以想把背景图的"窗口坐标
+        p"落在屏幕 p 处，就要摆到 `p + scroll`。自己会滚动的面板（牌堆）靠
+        `scroll_x/scroll_y` 补偿，背景才会像贴在窗口上一样不动。
+        """
+        photo = BACKDROP.photo
+        if photo is None:
+            return
+        try:
+            width, height = self.winfo_width(), self.winfo_height()
+            x = -ox + self.scroll_x
+            y = -oy + self.scroll_y
+            # 夹住：图比面板小的时候（例如对话框伸出主窗口范围）不能让边上露空
+            x = min(0.0, max(x, float(width - photo.width())))
+            y = min(0.0, max(y, float(height - photo.height())))
+            if self._bg_item is None or not self.find_withtag(self._bg_item):
+                self._bg_item = self.create_image(x, y, anchor="nw", image=photo)
+            else:
+                self.itemconfigure(self._bg_item, image=photo)
+                self.coords(self._bg_item, x, y)
+            self.tag_lower(self._bg_item)
+        except tk.TclError:
+            pass
+
+    def refresh_bg(self) -> None:
+        """位置变了（滚动 / 布局变化 / 背景图刚渲好）时把底图对齐、尺寸重排一次。"""
+        try:
+            w, h = self.winfo_width(), self.winfo_height()
+        except tk.TclError:
+            return
+        if w <= 2 or h <= 2:
+            return
+        ox, oy = self._origin()
+        self._draw_bg_image(ox, oy)
 
 
 def enable_dpi_awareness() -> None:
@@ -105,12 +598,15 @@ def short_url(url: str, keep: int = 14) -> str:
     return f"{head}{tok[:keep]}…{tok[-4:]}"
 
 
-class LaneCard(tk.Frame):
+class LaneCard(GlassPanel):
     """一条 lane 的卡片：名称 / 版本 + **profile 列表**（每个环境一行）+ 操作。
 
     lane ＝ 一个版本（一棵安装树 + 一个 DSH_HOME）；profile ＝ 这个 HOME 里的一个环境，
     各自有独立的插件组合，会话与凭据共享。每个 profile 行上有**实时端口框**：
     留空＝启动时自动挑空闲端口；填了但被占会自动改口——端口不再固定在配置里。
+
+    外观上它是一块圆角磨砂玻璃（GlassPanel）：四个圆角外面露出的是真实背景，
+    所以卡片看着是"浮"在那张彩色背景上的。
     """
 
     def __init__(
@@ -122,15 +618,15 @@ class LaneCard(tk.Frame):
         profile_states: dict[str, dict | None],
         profiles_view: dict[str, dict],
     ) -> None:
-        super().__init__(master, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
+        super().__init__(master, app, radius=CARD_RADIUS, pad=CARD_RADIUS, fill=CARD)
         self.app = app
         self.name = name
         self.data = data
         self.profile_states = profile_states or {}
         self.profiles_view = profiles_view or {}
 
-        pad = tk.Frame(self, bg=CARD)
-        pad.pack(fill="x", padx=14, pady=11)
+        pad = tk.Frame(self.body, bg=CARD)
+        pad.pack(fill="x", padx=12, pady=10)
 
         # ── 第一行：主体信息 + 主操作
         # 先放右侧定宽部件（按钮、徽章），最后放会撑开的左侧块，
@@ -229,57 +725,41 @@ class LaneCard(tk.Frame):
         foot = tk.Frame(pad, bg=CARD)
         foot.pack(fill="x")
 
-        acts = tk.Frame(foot, bg=CARD)
-        acts.pack(side="right")
-        self.app.link_button(
-            acts, "删除这套 DSH", lambda: self.app.delete_lane(self.name), fg=RED
-        ).pack(side="right")
+        # 次要操作分两行：一个版本能开的入口有七八个，挤一行会把文字压成一条竖线
+        # （曾经就是这样：说明文字被挤到 wraplength=120，竖着叠在链接上面）。
+        row1 = tk.Frame(foot, bg=CARD)
+        row1.pack(fill="x")
+        row2 = tk.Frame(foot, bg=CARD)
+        row2.pack(fill="x", pady=(4, 0))
+
+        for text, command, color in (
+            ("凭据…", lambda: self.app.credential_dialog(self.name), ACCENT_DK),
+            ("插件…", lambda: self.app.plugin_dialog(self.name), ACCENT_DK),
+            ("插件市场…", lambda: self.app.market_dialog(self.name), ACCENT_DK),
+            ("备份对话…", lambda: self.app.chat_dialog(self.name), ACCENT_DK),
+            ("配置备份…", lambda: self.app.cfg_dialog(self.name), ACCENT_DK),
+        ):
+            self.app.link_button(row1, text, command, fg=color).pack(side="left", padx=(0, 14))
         if data.get("kind") == "clone":
             self.app.link_button(
-                acts, "核对隔离", lambda: self.app.verify_lane(self.name), fg=ACCENT_DK
-            ).pack(side="right", padx=(0, 14))
-        self.app.link_button(
-            acts, "备份对话…", lambda: self.app.chat_dialog(self.name), fg=ACCENT_DK
-        ).pack(side="right", padx=(0, 14))
-        self.app.link_button(
-            acts, "插件市场…", lambda: self.app.market_dialog(self.name), fg=ACCENT_DK
-        ).pack(side="right", padx=(0, 14))
-        self.app.link_button(
-            acts, "复制…", lambda: self.app.clone_lane(self.name), fg=ACCENT_DK
-        ).pack(side="right", padx=(0, 14))
-        self.app.link_button(
-            acts, "升级版本…", lambda: self.app.upgrade_dialog(self.name), fg=ACCENT_DK
-        ).pack(side="right", padx=(0, 14))
-        self.app.link_button(
-            acts, "凭据…", lambda: self.app.credential_dialog(self.name), fg=ACCENT_DK
-        ).pack(side="right", padx=(0, 14))
+                row1, "核对隔离", lambda: self.app.verify_lane(self.name), fg=ACCENT_DK
+            ).pack(side="right")
 
-        note_text = (
-            "凭据…＝把其它版本的 API key 按条目勾选复制过来；"
-            "复制…＝整套复制成独立副本（升级测试用）；端口留空＝每次启动自动挑空闲。"
-        )
-        note = tk.Label(
-            foot,
-            text=note_text,
+        for text, command, color in (
+            ("复制…", lambda: self.app.clone_lane(self.name), ACCENT_DK),
+            ("升级版本…", lambda: self.app.upgrade_dialog(self.name), ACCENT_DK),
+        ):
+            self.app.link_button(row2, text, command, fg=color).pack(side="left", padx=(0, 14))
+        self.app.link_button(
+            row2, "删除这套 DSH", lambda: self.app.delete_lane(self.name), fg=RED
+        ).pack(side="right")
+        tk.Label(
+            row2,
+            text="端口留空＝自动挑空闲；插件…＝读取 / 迁移插件",
             bg=CARD,
-            fg=GRAY,
+            fg=FAINT,
             font=(FONT_UI, 8),
-            justify="left",
-            anchor="w",
-            wraplength=300,
-        )
-        note.pack(side="left", fill="x", expand=True)
-
-        def _rewrap(event) -> None:
-            try:
-                reserved = acts.winfo_reqwidth() + 16
-            except tk.TclError:
-                reserved = 0
-            w = max(120, event.width - reserved)
-            if abs(int(note.cget("wraplength")) - w) > 12:
-                note.configure(wraplength=w)
-
-        foot.bind("<Configure>", _rewrap)
+        ).pack(side="left", padx=(6, 0))
 
         # 双击卡片任意位置＝打开默认 profile
         def bind_open(widget) -> None:
@@ -506,22 +986,41 @@ class LaneCard(tk.Frame):
 
 class LauncherApp:
     _MAX_LOG_LINES = 4000
+    OUTER_PAD = 14               # 窗口四周的留白（留白里露出的是背景）
+    COL_GAP = 12                 # 左右两栏之间的缝
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.q: queue.Queue = queue.Queue()
         self.busy = False
         self.cfg = core.load_config()
+        self._log_buffer: list[tuple[str, str | None]] = []   # 换主题要重建界面，日志从这重放
+        self.glass_panels: list[GlassPanel] = []
+        self.list_items: list[dict] = []       # 左栏每一项：{id, widget, pad, gap, ...}
+        self.list_w = 0
+        self._list_y = float(LIST_PAD)
+        self._list_layout_job = None
+        self._relayout_job = None
+        self._aurora_job: str | None = None
+        self._aurora_thread: threading.Thread | None = None
+
+        ui = self.cfg.get("ui") or {}
+        apply_theme(ui.get("theme"), (int(ui.get("w") or 0), int(ui.get("h") or 0)))
 
         root.title("DSH 多版本启动器")
         root.configure(bg=BG)
-        ui = self.cfg.get("ui") or {}
         if ui.get("w") and ui.get("h"):
             root.geometry(f"{int(ui['w'])}x{int(ui['h'])}+{int(ui.get('x', 80))}+{int(ui.get('y', 60))}")
         else:
-            self._center(1060, 720)
-        root.minsize(880, 560)
+            self._center(1200, 780)
+        root.minsize(960, 620)
         self._style()
+
+        # 背景画布**第一个建**：Tk 里同级控件按创建顺序叠放，先建的在下层。
+        # 它铺满整个窗口，露在留白与面板之间的缝里。
+        self.backdrop_canvas = tk.Canvas(root, bg=BG, highlightthickness=0, bd=0)
+        self.backdrop_canvas.place(x=0, y=0, relwidth=1, relheight=1)
+        self._backdrop_item: int | None = None
 
         self._build_header()
         self._build_body()
@@ -545,6 +1044,9 @@ class LauncherApp:
         self.root.after(120, self._poll_queue)
         self.root.after(200, lambda: self.refresh_remote(force=True))  # 不挡开窗，查完再贴上去
         self.root.after(2000, self._tick)
+        self.root.after(60, self._schedule_backdrop)
+        self.root.after(60, self._replay_log)
+        self.root.bind("<Configure>", self._on_root_configure)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.bind("<F5>", lambda _e: self.manual_refresh())
         self.root.bind("<Control-l>", lambda _e: self.clear_log())
@@ -578,17 +1080,182 @@ class LauncherApp:
             pass
         style.configure("TCombobox", padding=4)
         style.configure("TEntry", padding=4)
-        style.configure("Vertical.TScrollbar", background=BORDER, troughcolor=BG, borderwidth=0)
+        style.configure("Vertical.TScrollbar", background=BORDER_SOFT, troughcolor=BG,
+                        bordercolor=BG, arrowcolor=MUTED, lightcolor=BORDER_SOFT,
+                        darkcolor=BORDER_SOFT, borderwidth=0, relief="flat")
+
+    # ── 背景（极光）与主题 ────────────────────────────────────────────────────
+    def _schedule_backdrop(self, delay: int = 200) -> None:
+        """窗口尺寸变了就重渲一次背景。防抖 + 后台线程：拖窗口时界面不卡。"""
+        if self._aurora_job:
+            try:
+                self.root.after_cancel(self._aurora_job)
+            except Exception:  # noqa: BLE001
+                pass
+            self._aurora_job = None
+        self._aurora_job = self.root.after(delay, self._start_backdrop)
+
+    def _on_root_configure(self, event) -> None:
+        if event.widget is not self.root:
+            return
+        self._schedule_backdrop()
+        # 布局还在动的时候别每帧重排（会闪）；停下来之后再整体重排一次
+        if getattr(self, "_relayout_job", None):
+            try:
+                self.root.after_cancel(self._relayout_job)
+            except Exception:  # noqa: BLE001
+                pass
+        self._relayout_job = self.root.after(120, self._relayout_glass_now)
+
+    def _relayout_glass_now(self) -> None:
+        self._relayout_job = None
+        self.relayout_glass()
+        if getattr(self, "list_panel", None) is not None:
+            self._on_list_configure(type("E", (), {"width": self.list_panel.winfo_width()})())
+
+    def _start_backdrop(self) -> None:
+        self._aurora_job = None
+        w, h = self.root.winfo_width(), self.root.winfo_height()
+        if w < 120 or h < 120:
+            return
+        key = (w, h, THEME_NAME)
+        if BACKDROP.key == key and BACKDROP.photo is not None:
+            return
+        BACKDROP.key = key
+        # 磨砂底色按**稳态尺寸**算，拖窗口时不跟着闪
+        apply_theme(THEME_NAME, (w, h))
+        self._aurora_thread = threading.Thread(
+            target=self._render_backdrop, args=(key, w, h, THEME), daemon=True)
+        self._aurora_thread.start()
+
+    def _render_backdrop(self, key: tuple, w: int, h: int, theme: dict) -> None:
+        """后台线程：渲染半分辨率的极光图，把 PPM 原始字节交给主线程建 PhotoImage。
+
+        为什么是**原始字节**而不是 base64：Tk 9 的 `photo -data` 一看到 base64 就按
+        PNG 去解（"data stream does not have a PNG signature"），base64 的 PPM 反而不认；
+        直接给字节它才走 PPM 解码器（实测 Tk 9.0.4：bytes(PPM) ✓、base64(PPM) ✗）。
+        """
+        try:
+            rw = max(2, w // AURORA_SCALE)
+            rh = max(2, h // AURORA_SCALE)
+            ppm = aurora_ppm(rw, rh, theme)
+        except Exception as exc:  # noqa: BLE001
+            # 背景只是观感，渲染失败不该让界面不可用；但也不能默默失败（否则就是"怎么一片死色"）
+            self.q.put(("line", f"[!!] 背景渲染失败：{type(exc).__name__}: {exc}"))
+            return
+        self.q.put(("aurora", (key, ppm)))
+
+    def _apply_backdrop(self, payload: tuple) -> None:
+        key, ppm = payload
+        if key != BACKDROP.key:
+            return                      # 尺寸已经又变过了，这批作废
+        try:
+            small = tk.PhotoImage(data=ppm)
+            photo = small.zoom(AURORA_SCALE) if AURORA_SCALE != 1 else small
+        except tk.TclError as exc:
+            self.log(f"[!!] 背景图创建失败：{exc}", "warn")
+            return
+        BACKDROP.small = small
+        BACKDROP.photo = photo
+        self._paint_backdrop()
+        self.sync_glass()
+
+    def _paint_backdrop(self) -> None:
+        canvas = getattr(self, "backdrop_canvas", None)
+        if canvas is None or BACKDROP.photo is None:
+            return
+        try:
+            if self._backdrop_item is None or not canvas.find_withtag(self._backdrop_item):
+                self._backdrop_item = canvas.create_image(0, 0, anchor="nw",
+                                                          image=BACKDROP.photo)
+            else:
+                canvas.itemconfigure(self._backdrop_item, image=BACKDROP.photo)
+        except tk.TclError:
+            pass
+
+    def sync_glass(self) -> None:
+        """让所有玻璃面板重新对齐背景（滚动时调：只挪底图，不重画形状，尽量便宜）。"""
+        if getattr(self, "list_panel", None) is not None:
+            try:
+                self.list_panel.scroll_y = self.list_panel.canvasy(0)
+            except tk.TclError:
+                pass
+        for panel in list(self.glass_panels):
+            try:
+                panel.refresh_bg()
+            except tk.TclError:
+                continue
+
+    def relayout_glass(self) -> None:
+        """布局变过之后重排每个面板（尺寸 + 形状 + 底图）。比 sync_glass 重，别每次滚动都调。"""
+        for panel in list(self.glass_panels):
+            try:
+                panel.redraw()
+            except tk.TclError:
+                continue
+
+    def toggle_theme(self) -> None:
+        """浅色 / 深色一键切换：写进 lanes.json 的 ui.theme，然后整体重建界面。"""
+        target = "dark" if THEME_NAME == "light" else "light"
+        try:
+            cfg = core.load_config()
+            ui = dict(cfg.get("ui") or {})
+            ui["theme"] = target
+            cfg["ui"] = ui
+            core.save_config(cfg)
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"[!!] 主题没记进 lanes.json（本次切换照样生效）：{exc}", "warn")
+        self.rebuild_ui(target)
+
+    def rebuild_ui(self, theme_name: str | None = None) -> None:
+        """换主题只能重建：颜色是模块级常量，建好的控件不会自己变。
+
+        重建前先记下窗口几何和日志内容，重建后放回去——不然一按主题按钮，
+        日志就空了、窗口还会跳回默认位置。
+        """
+        try:
+            geom = (self.root.winfo_width(), self.root.winfo_height(),
+                    self.root.winfo_x(), self.root.winfo_y())
+        except tk.TclError:
+            geom = None
+        saved_log = list(getattr(self, "_log_buffer", []))
+        apply_theme(theme_name or THEME_NAME, (geom[0], geom[1]) if geom else None)
+        for child in self.root.winfo_children():
+            child.destroy()
+        self.glass_panels = []
+        self.list_items = []
+        self.list_w = 0
+        self._list_y = float(LIST_PAD)
+        self._backdrop_item = None
+        BACKDROP.key = None
+
+        self.backdrop_canvas = tk.Canvas(self.root, bg=BG, highlightthickness=0, bd=0)
+        self.backdrop_canvas.place(x=0, y=0, relwidth=1, relheight=1)
+        self._style()
+        self._build_header()
+        self._build_body()
+        self._build_status()
+        if geom:
+            self.root.geometry(f"{geom[0]}x{geom[1]}+{geom[2]}+{geom[3]}")
+        self._log_buffer = []
+        for text, tag in saved_log:
+            self.log(text, tag)
+        self._sig = None
+        self.refresh_lanes(force=True)
+        self.log(f"已切换到{THEMES[THEME_NAME]['label']}主题。", "ok")
+        self._schedule_backdrop(40)
+        self.root.after(60, self._replay_log)
 
     def button(self, master, text, command, primary=False, danger=False, width=None):
-        bg = ACCENT if primary else (RED_BG if danger else "#FFFFFF")
-        fg = "#FFFFFF" if primary else (RED if danger else TEXT)
-        active = ACCENT_DK if primary else ("#FBE2E2" if danger else "#F0F1F3")
+        base = ACCENT if primary else (RED_BG if danger else BTN_BG)
+        fg = "#FFFFFF" if primary else (RED if danger else BTN_FG)
+        active = ACCENT_DK if primary else (mix(RED_BG, RED, 0.18) if danger
+                                            else BTN_BG_ON)
         btn = tk.Button(
             master,
             text=text,
             command=command,
-            bg=bg,
+            bg=base,
             fg=fg,
             activebackground=active,
             activeforeground=fg,
@@ -682,78 +1349,122 @@ class LauncherApp:
 
     # ── 顶部 ────────────────────────────────────────────────────────────────
     def _build_header(self) -> None:
-        head = tk.Frame(self.root, bg=BG)
-        head.pack(fill="x", padx=18, pady=(14, 8))
+        outer = tk.Frame(self.root, bg=BG)
+        outer.pack(fill="x", padx=self.OUTER_PAD, pady=(self.OUTER_PAD, 10))
+        panel = GlassPanel(outer, self, radius=PANEL_RADIUS, pad=16, fill="panel")
+        panel.pack(fill="x")
+        head = panel.body
 
-        # 右侧按钮**先** pack：窗口拉到最窄时宁可挤左边的文字，也不能把「＋ 新建版本」挤没
-        right = tk.Frame(head, bg=BG)
-        right.pack(side="right")
-        self.button(right, "刷新", self.manual_refresh).pack(side="left", padx=4)
-        self.button(right, "环境自检", lambda: self.run_job("环境自检", lambda: core.cmd_doctor(self.cfg, None))).pack(
-            side="left", padx=4
-        )
-        self.button(right, "全部停止", self.stop_all, danger=True).pack(side="left", padx=4)
-        self.button(right, "打开根目录", self.open_root_dir).pack(side="left", padx=4)
-        self.button(right, "＋ 新建版本", self.new_version_dialog, primary=True).pack(side="left", padx=(10, 0))
+        # 右侧按钮**先** pack：窗口拉到最窄时宁可挤左边的文字，也不能把「＋ 新建版本」挤没。
+        # 分两行是必要的：一排七八个按钮的"请求宽度"接近 620px，加上左边标题就是 1180+，
+        # 窗口不到 1300 就会被 pack 挤扁——被挤的按钮不会换行，只会把文字裁掉
+        # （实测：最右边那个「＋ 新建版本」只剩 57px，变成「＋ 新建」）。
+        right = tk.Frame(head, bg=PANEL)
+        right.pack(side="right", anchor="n")
+        row_a = tk.Frame(right, bg=PANEL)
+        row_a.pack(anchor="e")
+        row_b = tk.Frame(right, bg=PANEL)
+        row_b.pack(anchor="e", pady=(4, 0))
 
-        left = tk.Frame(head, bg=BG)
-        left.pack(side="left", fill="x", expand=True)
-        tk.Label(left, text="DSH 多版本启动器", bg=BG, fg=TEXT, font=(FONT_UI, 15, "bold")).pack(anchor="w")
+        self.button(row_a, "＋ 新建版本", self.new_version_dialog, primary=True).pack(side="left", padx=(0, 6))
+        self.button(row_a, "刷新", self.manual_refresh).pack(side="left", padx=(0, 6))
+        self.button(row_a, "插件库", self.plugin_dialog).pack(side="left")
+
+        self.button(row_b, "打开根目录", self.open_root_dir).pack(side="left", padx=(0, 6))
+        self.button(row_b, "全部停止", self.stop_all, danger=True).pack(side="left", padx=(0, 6))
+        self.button(row_b, "环境自检",
+                    lambda: self.run_job("环境自检", lambda: core.cmd_doctor(self.cfg, None))
+                    ).pack(side="left", padx=(0, 6))
+        self.button(row_b, THEMES["dark" if THEME_NAME == "light" else "light"]["label"] + "模式",
+                    self.toggle_theme).pack(side="left")
+
+        left = tk.Frame(head, bg=PANEL)
+        left.pack(side="left", fill="x", expand=True, anchor="n")
+        title = tk.Frame(left, bg=PANEL)
+        title.pack(anchor="w")
+        tk.Label(title, text="DSH 多版本启动器", bg=PANEL, fg=TEXT,
+                 font=(FONT_UI, 15, "bold")).pack(side="left")
+        tk.Label(title, text="  多版本 · 多环境 · 插件自由搬", bg=PANEL, fg=FAINT,
+                 font=(FONT_UI, 9)).pack(side="left", pady=(4, 0))
+        # 副标题按可用宽度换行。**必须先给一个小的初值**：不设的话 Label 会按"整句一行"
+        # 请求宽度（约 560px），pack 算总宽时把右边那排按钮一起挤扁。
         self.sub = tk.Label(
             left,
             text="一条 lane＝一个版本（独立安装树 + HOME）；版本内可开多个 profile 环境；"
                  "端口每次启动实时挑空闲",
-            bg=BG,
-            fg=MUTED,
-            font=(FONT_UI, 9),
-        )
-        self.sub.pack(anchor="w", pady=(2, 0))
-
-        # 第三行：npm 上现在有哪些版本（只读查询）+ 官方代码库入口
-        remote = tk.Frame(left, bg=BG)
-        remote.pack(anchor="w", pady=(4, 0))
-        self.remote_label = tk.Label(
-            remote,
-            text="正在查询 npm 上的最新版本…",
-            bg=BG,
+            bg=PANEL,
             fg=MUTED,
             font=(FONT_UI, 9),
             anchor="w",
+            justify="left",
+            wraplength=420,
+        )
+        self.sub.pack(anchor="w", pady=(3, 0), fill="x")
+
+        # 第三行：npm 上现在有哪些版本（只读查询）+ 官方代码库入口
+        remote = tk.Frame(left, bg=PANEL)
+        remote.pack(anchor="w", pady=(5, 0), fill="x")
+        self.remote_label = tk.Label(
+            remote,
+            text="正在查询 npm 上的最新版本…",
+            bg=PANEL,
+            fg=MUTED,
+            font=(FONT_UI, 9),
+            anchor="w",
+            justify="left",
+            wraplength=420,
         )
         self.remote_label.pack(side="left")
-        self.link_button(remote, "官方代码库 ↗", self.open_repo, fg=ACCENT_DK).pack(side="left", padx=(10, 0))
+        self.link_button(remote, "官方代码库 ↗", self.open_repo, fg=ACCENT_DK,
+                         bg=PANEL).pack(side="left", padx=(10, 0))
+
+        # 换行宽度跟着窗口走（右侧按钮占多少要扣掉）
+        def rewrap(event) -> None:
+            try:
+                reserved = right.winfo_reqwidth() + 30
+            except tk.TclError:
+                reserved = 0
+            width = max(160, event.width - reserved)
+            for widget in (self.sub, self.remote_label):
+                if abs(int(widget.cget("wraplength")) - width) > 16:
+                    widget.configure(wraplength=width)
+            if event.width < reserved + 240:
+                # 位置实在不够：把副标题藏起来，别让它挤成一条乱码
+                self.sub.pack_forget()
+            elif not self.sub.winfo_ismapped():
+                self.sub.pack(anchor="w", pady=(3, 0), fill="x")
+        panel.bind("<Configure>", rewrap)
 
     # ── 主体 ────────────────────────────────────────────────────────────────
     def _build_body(self) -> None:
         body = tk.Frame(self.root, bg=BG)
-        body.pack(fill="both", expand=True, padx=18, pady=(0, 8))
-        body.columnconfigure(0, weight=3, minsize=430)
-        body.columnconfigure(1, weight=2, minsize=330)
+        body.pack(fill="both", expand=True, padx=self.OUTER_PAD, pady=(0, 8))
+        body.columnconfigure(0, weight=3, minsize=440)
+        body.columnconfigure(1, weight=2, minsize=340)
         body.rowconfigure(0, weight=1)
 
-        # 左：lane 列表（可滚动）
+        # 左：lane 列表。它自己就是一块"玻璃窗"（fill=None＝不铺磨砂层，
+        # 直接把背景露出来），卡片浮在里面 —— 缝里看到的是真实背景。
         left_wrap = tk.Frame(body, bg=BG)
-        left_wrap.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        left_wrap.grid(row=0, column=0, sticky="nsew", padx=(0, self.COL_GAP))
         left_wrap.rowconfigure(0, weight=1)
         left_wrap.columnconfigure(0, weight=1)
 
-        self.canvas = tk.Canvas(left_wrap, bg=BG, highlightthickness=0)
-        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.list_panel = GlassPanel(left_wrap, self, radius=PANEL_RADIUS,
+                                     pad=LIST_PAD + SHADOW_PAD, fill=None,
+                                     body_window=False)
+        self.list_panel.grid(row=0, column=0, sticky="nsew")
+        self.canvas = self.list_panel
         sb = ttk.Scrollbar(left_wrap, orient="vertical", command=self.canvas.yview)
-        sb.grid(row=0, column=1, sticky="ns")
-        self.canvas.configure(yscrollcommand=sb.set)
-
-        self.list_frame = tk.Frame(self.canvas, bg=BG)
-        self._win = self.canvas.create_window((0, 0), window=self.list_frame, anchor="nw")
-        self.list_frame.bind(
-            "<Configure>", lambda _e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-        )
-        self.canvas.bind(
-            "<Configure>", lambda e: self.canvas.itemconfigure(self._win, width=e.width)
-        )
+        sb.grid(row=0, column=1, sticky="ns", padx=(4, 0))
+        self.sb = sb
+        self.canvas.configure(yscrollcommand=self._on_list_scroll)
+        self.canvas.bind("<Configure>", self._on_list_configure)
         self.canvas.bind_all("<MouseWheel>", self._on_wheel)
+        self.canvas.bind("<Button-4>", lambda _e: self._wheel_units(1))
+        self.canvas.bind("<Button-5>", lambda _e: self._wheel_units(-1))
 
-        # 右：日志
+        # 右：实时日志（一块磨砂玻璃面板）
         right = tk.Frame(body, bg=BG)
         right.grid(row=0, column=1, sticky="nsew")
         right.rowconfigure(1, weight=1)
@@ -765,15 +1476,17 @@ class LauncherApp:
         self.button(bar, "清空", self.clear_log).pack(side="right")
         self.button(bar, "复制全部", self.copy_log).pack(side="right", padx=4)
 
-        wrap = tk.Frame(right, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
-        wrap.grid(row=1, column=0, sticky="nsew")
+        log_panel = GlassPanel(right, self, radius=PANEL_RADIUS, pad=10, fill="panel",
+                               stretch=True)
+        log_panel.grid(row=1, column=0, sticky="nsew")
+        wrap = log_panel.body
         wrap.rowconfigure(0, weight=1)
         wrap.columnconfigure(0, weight=1)
         self.log_text = tk.Text(
             wrap,
             width=1,  # 关键：默认 80 字符会撑爆右列、把左列压扁（grid 先满足请求宽度再分权重）
             height=1,
-            bg="#FBFBFC",
+            bg=LOG_BG,
             fg=TEXT,
             relief="flat",
             wrap="word",
@@ -781,11 +1494,15 @@ class LauncherApp:
             padx=10,
             pady=8,
             insertbackground=TEXT,
+            highlightthickness=1,
+            highlightbackground=mix(LOG_BG, BORDER, 0.6),
+            highlightcolor=mix(LOG_BG, ACCENT, 0.5),
+            selectbackground=mix(LOG_BG, ACCENT, 0.35),
             state="disabled",
         )
         self.log_text.grid(row=0, column=0, sticky="nsew")
         lsb = ttk.Scrollbar(wrap, orient="vertical", command=self.log_text.yview)
-        lsb.grid(row=0, column=1, sticky="ns")
+        lsb.grid(row=0, column=1, sticky="ns", padx=(6, 0))
         self.log_text.configure(yscrollcommand=lsb.set)
         self.log_text.tag_configure("head", foreground=ACCENT, font=(FONT_MONO, 9, "bold"))
         self.log_text.tag_configure("ok", foreground=GREEN)
@@ -795,19 +1512,118 @@ class LauncherApp:
 
     def _build_status(self) -> None:
         bar = tk.Frame(self.root, bg=BG)
-        bar.pack(fill="x", padx=18, pady=(0, 12))
-        self.status = tk.Label(bar, text="就绪", bg=BG, fg=MUTED, font=(FONT_UI, 9), anchor="w")
+        bar.pack(fill="x", padx=self.OUTER_PAD, pady=(0, self.OUTER_PAD - 2))
+        panel = GlassPanel(bar, self, radius=12, pad=10, shadow=0, fill=PANEL)
+        panel.pack(fill="x")
+        inner = panel.body
+        self.status = tk.Label(inner, text="就绪", bg=PANEL, fg=MUTED, font=(FONT_UI, 9), anchor="w")
         self.status.pack(side="left")
-        self.busy_label = tk.Label(bar, text="", bg=BG, fg=ACCENT, font=(FONT_UI, 9, "bold"))
+        self.busy_label = tk.Label(inner, text="", bg=PANEL, fg=ACCENT, font=(FONT_UI, 9, "bold"))
         self.busy_label.pack(side="right")
-        self.counts = tk.Label(bar, text="", bg=BG, fg=MUTED, font=(FONT_UI, 9))
+        self.counts = tk.Label(inner, text="", bg=PANEL, fg=MUTED, font=(FONT_UI, 9))
         self.counts.pack(side="right", padx=14)
 
-    def _on_wheel(self, event) -> None:
+    # ── 左栏（牌堆）滚动 ─────────────────────────────────────────────────────
+    def _on_list_scroll(self, first, last) -> None:
         try:
-            self.canvas.yview_scroll(int(-event.delta / 120), "units")
+            self.sb.set(first, last)
+        except tk.TclError:
+            return
+        self.sync_glass()
+
+    def _on_list_configure(self, event) -> None:
+        self.list_w = max(200, int(event.width))
+        # 宽度变了要把每一项重排一次（高度是随宽度变的），但拖窗口时每像素都排会闪，
+        # 所以等布局停下来再做。
+        if getattr(self, "_list_layout_job", None):
+            try:
+                self.root.after_cancel(self._list_layout_job)
+            except Exception:  # noqa: BLE001
+                pass
+        self._list_layout_job = self.root.after(30, self._relayout_list)
+
+    def _on_wheel(self, event) -> None:
+        self._wheel_units(int(-event.delta / 120) or (-1 if event.delta > 0 else 1))
+
+    def _wheel_units(self, units: int) -> None:
+        try:
+            self.canvas.yview_scroll(units, "units")
+        except tk.TclError:
+            return
+        self.sync_glass()
+
+    # ── 往牌堆里放东西 ───────────────────────────────────────────────────────
+    def _add_list_item(self, widget, gap: int = GAP, pad: int = LIST_PAD) -> None:
+        """把一个控件放进左栏（作为画布上的窗口）。
+
+        这里**不用 pack**：左栏本身是 Canvas，Canvas 不会跟着子控件长高，而我们要的是
+        "背景贴在窗口上、内容自己滚"，所以位置由我们自己算。
+        先摆在预估位置，随后 `_relayout_list` 会按真实宽度重排一次 —— 首次刷新时画布还没
+        布局（宽度是 1），照那个宽度算高度会把每张卡片都算得极高，位置就全错了。
+        """
+        width = max(80, self._list_width() - 2 * pad)
+        item = self.canvas.create_window(pad, self._list_y, anchor="nw",
+                                         window=widget, width=width)
+        self.list_items.append({"id": item, "widget": widget, "pad": pad, "gap": gap})
+        self._list_y += widget.winfo_reqheight() + gap
+
+    def _list_section(self, text: str, gap: int = GAP) -> None:
+        """左栏里的小标题：直接画成画布文字（Label 会带一块自己的底色，很难看）。"""
+        item = self.canvas.create_text(LIST_PAD + 2, self._list_y + 4, anchor="nw",
+                                       text=text, fill=MUTED, font=(FONT_UI, 9, "bold"))
+        self.list_items.append({"id": item, "widget": None, "pad": LIST_PAD + 2,
+                                "gap": gap, "height": 22, "dy": 4})
+        self._list_y += 22 + gap
+
+    def _list_width(self) -> int:
+        """左栏可用宽度。还没布局时先用一个估值，别拿 1px 去算高度。"""
+        try:
+            width = int(self.canvas.winfo_width())
+        except tk.TclError:
+            width = 0
+        if width <= 1:
+            width = self.list_w or 460
+        return max(200, width)
+
+    def _relayout_list(self) -> None:
+        """按当前宽度重排整列：每一项的宽度、y 位置、以及滚动的总高度。"""
+        self._list_layout_job = None
+        self.list_w = self._list_width()
+        y = float(LIST_PAD)
+        for entry in self.list_items:
+            widget = entry["widget"]
+            try:
+                if widget is None:
+                    self.canvas.coords(entry["id"], entry["pad"], y + entry.get("dy", 0))
+                    y += entry.get("height", 22) + entry["gap"]
+                    continue
+                self.canvas.itemconfigure(
+                    entry["id"], width=max(80, self.list_w - 2 * entry["pad"]))
+                self.canvas.coords(entry["id"], entry["pad"], y)
+                self.root.update_idletasks()      # 宽度变了高度才准
+                y += widget.winfo_reqheight() + entry["gap"]
+            except tk.TclError:
+                continue
+        self._list_y = y
+        try:
+            self.canvas.configure(scrollregion=(0, 0, self.list_w, y))
+        except tk.TclError:
+            return
+        self.sync_glass()
+
+    def _list_cursor(self) -> float:
+        """下一个控件要放的 y。"""
+        return getattr(self, "_list_y", float(LIST_PAD))
+
+    def _finish_list(self) -> None:
+        """收尾：先按估值摆好，等布局落定后再整体重排一次（那时宽度才是真的）。"""
+        try:
+            self.canvas.configure(scrollregion=(0, 0, self._list_width(), self._list_cursor()))
         except tk.TclError:
             pass
+        self.sync_glass()
+        self.root.after_idle(self._relayout_list)
+        self.root.after_idle(self.relayout_glass)
 
     # ── 日志 ────────────────────────────────────────────────────────────────
     def _tag_for(self, text: str, tag: str | None = None) -> str:
@@ -829,6 +1645,11 @@ class LauncherApp:
         """
         if not items:
             return
+        for raw, tag in items:
+            line = ANSI_RE.sub("", str(raw))
+            self._log_buffer.append((line, self._tag_for(line, tag)))
+        if len(self._log_buffer) > self._MAX_LOG_LINES:
+            del self._log_buffer[: len(self._log_buffer) - self._MAX_LOG_LINES]
         text = self.log_text
         text.configure(state="normal")
         for raw, tag in items:
@@ -840,8 +1661,42 @@ class LauncherApp:
                 text.delete("1.0", f"{total - self._MAX_LOG_LINES}.0")
         except (tk.TclError, ValueError):
             pass
-        text.see("end")
+        # 控件还没布局（宽度/高度还是 1）时**不要** see/xview：那时滚出来的位置是错的，
+        # 之后控件长大了也不会自己回去——表现出来就是"只剩最后一行、还被裁掉半个字"。
+        # 这种情况交给 _replay_log()（布局完成后按缓冲区重放一遍）。
+        if self._log_ready():
+            text.see("end")
+            # see("end") 之后必须把横向滚动拨回 0：日志里有超长行（npm 输出、traceback）时，
+            # Tk 会顺手横向滚一下，后面所有行都被推到左边裁掉半个字。
+            try:
+                text.xview_moveto(0.0)
+            except tk.TclError:
+                pass
         text.configure(state="disabled")
+
+    def _log_ready(self) -> bool:
+        try:
+            return self.log_text.winfo_width() > 40 and self.log_text.winfo_height() > 20
+        except tk.TclError:
+            return False
+
+    def _replay_log(self, tries: int = 0) -> None:
+        """布局完成之后按缓冲区把日志整段重放：一次 insert，位置才是对的。"""
+        if not self._log_ready():
+            if tries < 25:          # 别无限重试（窗口一直没布局的话，比如 --selfcheck 里藏了窗口）
+                self.root.after(80, lambda: self._replay_log(tries + 1))
+            return
+        text = self.log_text
+        try:
+            text.configure(state="normal")
+            text.delete("1.0", "end")
+            for line, tag in self._log_buffer:
+                text.insert("end", line + "\n", tag)
+            text.see("end")
+            text.xview_moveto(0.0)
+            text.configure(state="disabled")
+        except tk.TclError:
+            pass
 
     def log(self, text: str, tag: str | None = None) -> None:
         self._log_lines([(text, tag)])
@@ -951,55 +1806,60 @@ class LauncherApp:
             return
         self._sig = snap["signature"]
         self.cfg = snap["cfg"]
-        for child in self.list_frame.winfo_children():
-            child.destroy()
+        # 清空牌堆：画布上的窗口项 + 控件一起撤掉，y 游标归零（见 _add_list_item）
+        for entry in self.list_items:
+            try:
+                self.canvas.delete(entry["id"])
+            except tk.TclError:
+                pass
+        self.list_items = []
+        self._list_y = float(LIST_PAD)
 
         lanes = self.cfg.get("lanes", {})
         if not lanes:
-            box = tk.Frame(self.list_frame, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
-            box.pack(fill="x", pady=4)
+            box = GlassPanel(self.canvas, self, radius=CARD_RADIUS, pad=CARD_RADIUS, fill=CARD)
             tk.Label(
-                box,
+                box.body,
                 text="还没有任何 lane",
                 bg=CARD,
                 fg=TEXT,
                 font=(FONT_UI, 11, "bold"),
-            ).pack(anchor="w", padx=16, pady=(14, 2))
+            ).pack(anchor="w", padx=12, pady=(10, 2))
             tk.Label(
-                box,
+                box.body,
                 text="点右上角「＋ 新建版本」，选一个版本装进来（例如 next / 0.1.7-rc.2）。\n"
                      "装好之后这里会出现卡片：卡片上是这条 lane 的 profiles（环境）列表，\n"
                      "每个 profile 可以单独打开/停止，端口留空＝每次启动自动挑空闲端口。\n\n"
                      "同一条 lane 里可以「＋ 添加 Profile」开出多个环境（各自装各自的插件），\n"
-                     "不必为每个环境复制一整套 dsh；API key 用「凭据…」按条目从其它版本复制。",
+                     "不必为每个环境复制一整套 dsh；插件可以用「插件库」从别的环境搬过来。",
                 bg=CARD,
                 fg=MUTED,
                 font=(FONT_UI, 9),
                 justify="left",
-            ).pack(anchor="w", padx=16, pady=(0, 14))
+            ).pack(anchor="w", padx=12, pady=(0, 10))
+            self._add_list_item(box)
         else:
             # core.lane_profiles_view：磁盘真值 ∪ lanes.json 登记
             for name, data in lanes.items():
                 if not isinstance(data, dict):
                     continue
                 card = LaneCard(
-                    self.list_frame,
+                    self.canvas,
                     self,
                     name,
                     data,
                     snap["states"].get(name) or {},
                     core.lane_profiles_view(self.cfg, name),
                 )
-                card.pack(fill="x", pady=4)
+                self._add_list_item(card)
 
         self._build_foreign_section(snap)
+        self._finish_list()
         self._update_counts(snap)
 
     # ── 未登记实例 / 系统全局安装 ───────────────────────────────────────────
     def _section(self, text: str) -> None:
-        tk.Label(
-            self.list_frame, text=text, bg=BG, fg=MUTED, font=(FONT_UI, 9, "bold")
-        ).pack(anchor="w", pady=(14, 2))
+        self._list_section(text)
 
     def _build_foreign_section(self, snap: dict) -> None:
         instances = snap["foreign"]
@@ -1011,19 +1871,17 @@ class LauncherApp:
         self._section("未登记的实例（不是本启动器启动的）")
 
         if not instances:
-            tk.Label(
-                self.list_frame,
-                text="（当前没有别的 DSH 实例在跑）",
-                bg=BG,
-                fg=GRAY,
-                font=(FONT_UI, 9),
-            ).pack(anchor="w", pady=(0, 4))
+            y = self._list_cursor()
+            item = self.canvas.create_text(LIST_PAD + 2, y, anchor="nw",
+                                           text="（当前没有别的 DSH 实例在跑）", fill=FAINT,
+                                           font=(FONT_UI, 9))
+            self.list_items.append({"id": item, "widget": None, "pad": LIST_PAD + 2,
+                                    "gap": GAP, "height": 20, "dy": 0})
+            self._list_y = y + 20 + GAP
 
         for item in instances:
-            card = tk.Frame(self.list_frame, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
-            card.pack(fill="x", pady=4)
-            pad = tk.Frame(card, bg=CARD)
-            pad.pack(fill="x", padx=14, pady=11)
+            card = GlassPanel(self.canvas, self, radius=CARD_RADIUS, pad=CARD_RADIUS, fill=CARD)
+            pad = card.body
 
             btns = tk.Frame(pad, bg=CARD)
             btns.pack(side="right")
@@ -1065,7 +1923,7 @@ class LauncherApp:
                 left,
                 text=f"启动于 {item.get('started') or '?'}　·　非本启动器管理",
                 bg=CARD,
-                fg=GRAY,
+                fg=FAINT,
                 font=(FONT_UI, 8),
             ).pack(anchor="w", pady=(1, 0))
             link = tk.Label(
@@ -1079,12 +1937,11 @@ class LauncherApp:
             )
             link.pack(anchor="w", pady=(2, 0))
             link.bind("<Button-1>", lambda _e, u=item["url"]: self.copy_text(u))
+            self._add_list_item(card)
 
         if installs:
-            card = tk.Frame(self.list_frame, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
-            card.pack(fill="x", pady=4)
-            pad = tk.Frame(card, bg=CARD)
-            pad.pack(fill="x", padx=14, pady=11)
+            card = GlassPanel(self.canvas, self, radius=CARD_RADIUS, pad=CARD_RADIUS, fill=CARD)
+            pad = card.body
             self.button(pad, "打开根目录", self.open_root_dir).pack(side="right")
             left = tk.Frame(pad, bg=CARD)
             left.pack(side="left", fill="x", expand=True)
@@ -1117,7 +1974,7 @@ class LauncherApp:
                     text,
                     text=item["path"],
                     bg=CARD,
-                    fg=GRAY,
+                    fg=FAINT,
                     font=(FONT_MONO, 8),
                     anchor="w",
                     wraplength=250,
@@ -1127,11 +1984,12 @@ class LauncherApp:
                 left,
                 text="「加入 lane 列表」＝用它现有的 DSH_HOME（~/.dsh）注册成一条 lane，之后就能在这里打开/停止它。",
                 bg=CARD,
-                fg=GRAY,
+                fg=FAINT,
                 font=(FONT_UI, 8),
                 wraplength=330,
                 justify="left",
             ).pack(anchor="w", pady=(4, 0))
+            self._add_list_item(card)
 
     def _tick(self) -> None:
         if not self.busy:
@@ -1191,6 +2049,8 @@ class LauncherApp:
                     self.set_status(f"{payload} 失败")
                     self._invalidate()
                     self.refresh_lanes(force=True)
+                elif kind == "aurora":
+                    self._apply_backdrop(payload)
                 elif kind == "callback":
                     try:
                         payload()
@@ -1958,9 +2818,9 @@ class LauncherApp:
         dlg.configure(bg=BG)
         dlg.transient(self.root)
         dlg.resizable(False, False)
-        w, h = 580, 380
+        w, h = 620, 540
         x = self.root.winfo_rootx() + (self.root.winfo_width() - w) // 2
-        y = self.root.winfo_rooty() + 80
+        y = self.root.winfo_rooty() + 60
         dlg.geometry(f"{w}x{h}+{max(0, x)}+{max(0, y)}")
         dlg.grab_set()
 
@@ -1977,12 +2837,12 @@ class LauncherApp:
             bg=BG,
             fg=MUTED,
             font=(FONT_UI, 9),
-            wraplength=520,
+            wraplength=560,
             justify="left",
         ).pack(anchor="w", padx=20)
 
         form = tk.Frame(dlg, bg=BG)
-        form.pack(fill="x", padx=20, pady=14)
+        form.pack(fill="x", padx=20, pady=(14, 6))
         form.columnconfigure(1, weight=1)
         tk.Label(form, text="新 lane 名", bg=BG, fg=TEXT, font=(FONT_UI, 10)).grid(
             row=0, column=0, sticky="w", pady=6
@@ -1991,18 +2851,89 @@ class LauncherApp:
         ttk.Entry(form, textvariable=name_var).grid(row=0, column=1, sticky="ew", padx=(10, 0), pady=6)
         tk.Label(
             form,
-            text="端口：启动时实时挑空闲端口（这条 lane 的全部 profile 都会跟着 HOME 复制过来）",
+            text="端口：启动时实时挑空闲端口",
             bg=BG, fg=GRAY, font=(FONT_UI, 8),
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 6))
 
-        size_hint = tk.Label(dlg, text="正在估算体积…", bg=BG, fg=GRAY, font=(FONT_UI, 9), anchor="w")
+        # ── 要复制的 profile（环境）：体积主要在它们的 node_modules 上，所以默认可挑
+        prof_vars: dict[str, tk.BooleanVar] = {}
+        on_disk = sorted(core.disk_profiles(core.lane_home(core.load_config(), lane)))
+        tk.Label(dlg, text="要一起复制过来的 profile（环境）", bg=BG, fg=TEXT,
+                 font=(FONT_UI, 10)).pack(anchor="w", padx=20)
+        wrap = tk.Frame(dlg, bg=BG)
+        wrap.pack(fill="x", padx=20, pady=(2, 0))
+        canvas = tk.Canvas(wrap, bg=CARD, height=112, bd=0, highlightthickness=1,
+                           highlightbackground=BORDER)
+        sb = ttk.Scrollbar(wrap, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        inner = tk.Frame(canvas, bg=CARD)
+        inner_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>",
+                   lambda _e: canvas.configure(scrollregion=canvas.bbox("all") or (0, 0, 0, 0)))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfigure(inner_id, width=max(120, e.width)))
+
+        def _wheel(event) -> None:
+            try:
+                canvas.yview_scroll(int(-event.delta / 120) or (-1 if event.delta > 0 else 1), "units")
+            except tk.TclError:
+                pass
+
+        for target in (canvas, inner):
+            # 不用 bind_all：那会把主窗口的滚轮绑定顶掉，关掉这个窗口后主窗口就滚不动了
+            target.bind("<MouseWheel>", _wheel)
+
+        if not on_disk:
+            tk.Label(inner, text="（这条 lane 的 HOME 里还没有任何 profile —— 副本会是个空环境，"
+                                 "首次打开时初始化）",
+                     bg=CARD, fg=AMBER, font=(FONT_UI, 9), justify="left",
+                     wraplength=520).pack(anchor="w", padx=10, pady=8)
+        for prof in on_disk:
+            var = tk.BooleanVar(value=True)
+            prof_vars[prof] = var
+            tk.Checkbutton(
+                inner, text=f"{prof}　（HOME\\profiles\\{prof}，含这一套插件组合）",
+                variable=var, bg=CARD, fg=TEXT, selectcolor="#FFFFFF",
+                activebackground=CARD, activeforeground=TEXT, font=(FONT_UI, 9),
+                anchor="w", highlightthickness=0, cursor="hand2",
+                command=lambda: schedule_plan(),
+            ).pack(fill="x", padx=10, pady=1)
+
+        prof_note = tk.Label(dlg, text="", bg=BG, fg=GRAY, font=(FONT_UI, 9), anchor="w")
+        prof_note.pack(fill="x", padx=20)
+
+        def selected() -> list[str]:
+            return [name for name, var in prof_vars.items() if var.get()]
+
+        pick_row = tk.Frame(dlg, bg=BG)
+        pick_row.pack(fill="x", padx=20, pady=(2, 0))
+        self.link_button(pick_row, "全选", lambda: pick(True), fg=ACCENT_DK).pack(side="left")
+        self.link_button(pick_row, "全不选", lambda: pick(False), fg=MUTED).pack(side="left", padx=(12, 0))
+
+        def pick(value: bool) -> None:
+            for var in prof_vars.values():
+                var.set(value)
+            schedule_plan()
+
+        size_hint = tk.Label(dlg, text="正在估算体积…", bg=BG, fg=GRAY, font=(FONT_UI, 9), anchor="w",
+                             justify="left", wraplength=560)
         size_hint.pack(fill="x", padx=20)
+
+        plan_job = {"timer": None, "running": False, "again": False}
 
         def fill_size() -> None:
             # 体积统计要扫 1GB 多的目录，放后台线程，别冻住对话框
+            if plan_job["running"]:
+                plan_job["again"] = True
+                return
+            plan_job["running"] = True
+            chosen = selected()
             try:
                 plan = core.lane_clone_plan(
-                    core.load_config(), lane, name_var.get().strip() or f"{lane}-copy", sizes=True
+                    core.load_config(), lane, name_var.get().strip() or f"{lane}-copy",
+                    sizes=True, profiles=(chosen if prof_vars else None),
                 )
                 need = (plan["home_size"] or 0) + (plan["install_size"] or 0)
                 parts = [
@@ -2010,6 +2941,9 @@ class LauncherApp:
                     f"（安装树 {core.human_size(plan['install_size'] or 0)}"
                     f" + HOME {core.human_size(plan['home_size'] or 0)}）"
                 ]
+                if plan["profiles_skipped"]:
+                    parts.append(f"整份 HOME 是 {core.human_size(plan['home_size_all'] or 0)}，"
+                                 f"跳过 {'、'.join(plan['profiles_skipped'])}")
                 if plan["free"]:
                     parts.append(f"目标盘剩余 {core.human_size(plan['free'])}")
                 if plan["problems"]:
@@ -2020,15 +2954,35 @@ class LauncherApp:
                 text, bg, fg = f"体积估算失败：{exc}", AMBER_BG, AMBER
 
             def apply() -> None:
+                plan_job["running"] = False
                 try:
                     if dlg.winfo_exists():
                         size_hint.configure(text=text, bg=bg, fg=fg)
+                        if prof_vars:
+                            prof_note.configure(
+                                text=f"已选 {len(selected())} / {len(prof_vars)} 个　·　"
+                                     "没选的 profile 不会进副本")
                 except tk.TclError:
                     pass
+                if plan_job["again"]:
+                    plan_job["again"] = False
+                    schedule_plan()
 
             self.root.after(0, apply)
 
-        threading.Thread(target=fill_size, daemon=True).start()
+        def schedule_plan(delay: int = 250) -> None:
+            if prof_vars:
+                prof_note.configure(text=f"已选 {len(selected())} / {len(prof_vars)} 个　·　"
+                                         "没选的 profile 不会进副本")
+            if plan_job["timer"] is not None:
+                try:
+                    self.root.after_cancel(plan_job["timer"])
+                except tk.TclError:
+                    pass
+            plan_job["timer"] = self.root.after(
+                delay, lambda: threading.Thread(target=fill_size, daemon=True).start())
+
+        schedule_plan(0)
 
         btns = tk.Frame(dlg, bg=BG)
         btns.pack(fill="x", padx=20, pady=(6, 16), side="bottom")
@@ -2044,11 +2998,18 @@ class LauncherApp:
             if new in (core.load_config().get("lanes") or {}):
                 messagebox.showwarning("复制", f"lane「{new}」已经存在了", parent=dlg)
                 return
+            chosen = selected()
+            if prof_vars and not chosen:
+                messagebox.showwarning("复制", "一个 profile 都没选 —— 至少留一个（不想挑就「全选」）",
+                                       parent=dlg)
+                return
             dlg.destroy()
             self.run_job(
                 f"复制 {lane} → {new}",
                 lambda: core.cmd_clone(
-                    core.load_config(), argparse.Namespace(source=lane, lane=new, port=None)
+                    core.load_config(),
+                    argparse.Namespace(source=lane, lane=new, port=None,
+                                       profiles=(chosen or None)),
                 ),
             )
 
@@ -2568,6 +3529,322 @@ class LauncherApp:
         ttk.Button(btns, text="恢复选中的", command=do_restore).pack(side="left", padx=(8, 0))
         ttk.Button(btns, text="删除选中的", command=do_rm).pack(side="left", padx=(8, 0))
 
+    def cfg_dialog(self, lane: str = "") -> None:
+        """配置备份 / 迁移：轻量 zip（插件清单+会话+设置），恢复时自动联网装回插件。
+
+        与「备份对话」（只备份 sessions）、「复制…」（整树复制、慢）互补。
+        """
+        cfg = core.load_config()
+        dlg = tk.Toplevel(self.root)
+        dlg.title("配置备份 / 迁移")
+        dlg.configure(bg=BG)
+        dlg.transient(self.root)
+        w, h = 860, 560
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - w) // 2
+        y = self.root.winfo_rooty() + 50
+        dlg.geometry(f"{w}x{h}+{max(0, x)}+{max(0, y)}")
+        dlg.grab_set()
+
+        tk.Label(dlg, text="配置备份 / 迁移（插件清单 + 会话 + 设置）", bg=BG, fg=TEXT,
+                 font=(FONT_UI, 13, "bold")).pack(anchor="w", padx=18, pady=(14, 4))
+        tk.Label(
+            dlg,
+            text=(
+                "不复制 dsh 安装树和 profiles 下的插件本体（几百 MB），只备份「装了什么、"
+                "说了什么、怎么配置」；恢复到新版本时按清单逐个联网装回（版本精确到当前值）。\n"
+                "备份是单个 zip，放在根目录 backups\\config 下，可拷到别的机器。"
+            ),
+            bg=BG, fg=MUTED, font=(FONT_UI, 9), justify="left", wraplength=810,
+        ).pack(anchor="w", padx=18)
+
+        head = tk.Frame(dlg, bg=BG)
+        head.pack(fill="x", padx=18, pady=(10, 0))
+        tk.Label(
+            head,
+            text=f"{'备份名':<40}{'来源':<22}{'环境':<12}{'插件':>4}{'会话':>5}{'大小':>10}",
+            bg=BG, fg=MUTED, font=(FONT_MONO, 9),
+        ).pack(anchor="w")
+
+        wrap = tk.Frame(dlg, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
+        wrap.pack(fill="both", expand=True, padx=18, pady=(4, 6))
+        scroll = ttk.Scrollbar(wrap, orient="vertical")
+        box = tk.Listbox(wrap, bg=CARD, fg=TEXT, font=(FONT_MONO, 9), activestyle="none",
+                         selectbackground=ACCENT, selectforeground="#FFFFFF",
+                         highlightthickness=0, yscrollcommand=scroll.set)
+        scroll.configure(command=box.yview)
+        scroll.pack(side="right", fill="y")
+        box.pack(side="left", fill="both", expand=True)
+
+        status = tk.Label(dlg, text="正在读取备份列表…", bg=BG, fg=GRAY, font=(FONT_UI, 9),
+                          justify="left", anchor="w", wraplength=810)
+        status.pack(fill="x", padx=18)
+        items: list[dict] = []
+
+        def load() -> None:
+            try:
+                snaps = core.cfg_list_backups(cfg)
+            except Exception as exc:  # noqa: BLE001
+                self.root.after(0, lambda: status.configure(text=f"读取失败：{exc}", fg=RED))
+                return
+
+            def apply() -> None:
+                try:
+                    if not dlg.winfo_exists():
+                        return
+                except tk.TclError:
+                    return
+                items.clear()
+                items.extend(snaps)
+                box.delete(0, "end")
+                for it in snaps:
+                    if not it["ok"]:
+                        box.insert("end", f"{it['name'][:39]:<40}{'[损坏] ' + it['error'][:60]}")
+                        continue
+                    src = f"{it['sourceLane']}@{it['dshVersion']}"
+                    box.insert(
+                        "end",
+                        f"{it['name'][:39]:<40}{src[:21]:<22}{','.join(it['profiles'])[:11]:<12}"
+                        f"{it['thirdParty']:>4}{it['sessions']:>5}{core.human_size(it['bytes']):>10}"
+                        + ("  含凭据" if it["credentials"] else ""),
+                    )
+                status.configure(text=f"{len(snaps)} 份配置备份", fg=GRAY)
+
+            self.root.after(0, apply)
+
+        threading.Thread(target=load, daemon=True).start()
+
+        btns = tk.Frame(dlg, bg=BG)
+        btns.pack(fill="x", padx=18, pady=(8, 14))
+
+        def picked() -> dict | None:
+            sel = box.curselection()
+            if not sel:
+                messagebox.showinfo("配置备份", "先在列表里选一份备份", parent=dlg)
+                return None
+            it = items[int(sel[0])]
+            if not it["ok"]:
+                messagebox.showwarning("配置备份", "这份备份损坏，无法使用", parent=dlg)
+                return None
+            return it
+
+        def do_backup() -> None:
+            lanes = sorted((cfg.get("lanes") or {}).keys())
+            src = lane
+            if not src:
+                src = simpledialog.askstring(
+                    "配置备份", f"备份哪条 lane？\n（{', '.join(lanes)}）", parent=dlg)
+            if src is None:
+                return
+            src = src.strip()
+            if src not in (cfg.get("lanes") or {}):
+                messagebox.showwarning("配置备份", f"没有 lane「{src}」", parent=dlg)
+                return
+            label = simpledialog.askstring(
+                "配置备份", "给备份起个后缀名（可留空，例如 before-reinstall）：", parent=dlg)
+            if label is None:
+                return
+            with_cred = messagebox.askyesno(
+                "配置备份",
+                "是否把凭据（API key 等敏感信息）一起打包？\n\n选「否」＝不含（推荐）。",
+                parent=dlg)
+            data = simpledialog.askstring(
+                "配置备份",
+                "还要带哪些插件数据目录？（填目录名，逗号分隔，留空不带）\n\n"
+                "例如：skills,.agent-presets,whale-roles\n"
+                "体积大的工作数据默认不打；需要时在日志里看目录名。",
+                parent=dlg)
+            if data is None:
+                return
+            data_names = [x.strip() for x in data.replace("，", ",").split(",") if x.strip()]
+            args = argparse.Namespace(
+                lane=src, name=(label.strip() or None), yes=True,
+                no_sessions=False, no_attachments=False, no_settings=False,
+                credentials=bool(with_cred), data=data_names, profiles=None)
+            self.run_job(f"配置备份：{src}",
+                         lambda: core.cmd_cfg_backup(core.load_config(), args),
+                         on_done=load)
+
+        def do_show() -> None:
+            it = picked()
+            if not it:
+                return
+            try:
+                path = core.cfg_resolve_backup(cfg, it["name"])
+                manifest = core.cfg_read_manifest(path)
+                s = core.cfg_summary(manifest)
+            except Exception as exc:  # noqa: BLE001
+                messagebox.showerror("配置备份", str(exc), parent=dlg)
+                return
+            lines = [f"备份：{it['name']}（{core.human_size(it['bytes'])}）",
+                     f"来源：{s['source'].get('lane')}（dsh {s['source'].get('dshVersion')}）"
+                     f"  打包于 {s['created']}", ""]
+            for p in s["profiles"]:
+                lines.append(f"profile「{p['name']}」（{len(p['thirdParty'])} 个第三方插件）：")
+                for x in p["thirdParty"]:
+                    state = "关闭" if x.get("disabledRows") else "启用"
+                    lines.append(f"    {x.get('pkg')}  {x.get('version') or x.get('spec')}  [{state}]")
+            if s["sessions"].get("included"):
+                lines.append(f"会话：{s['sessions']['files']} 个 / "
+                             f"{core.human_size(s['sessions']['bytes'])}")
+            if s["settings"].get("included"):
+                lines.append(f"设置：{len(s['settings']['files'])} 项")
+            if s["credentials"].get("included"):
+                lines.append(f"凭据：{len(s['credentials'].get('entries') or [])} 条（敏感）")
+            if s["localFiles"]:
+                lines.append(f"本地插件：{len(s['localFiles'])} 个")
+            if s["pluginData"]:
+                lines.append(f"数据目录：{', '.join(x['name'] for x in s['pluginData'])}")
+            win = tk.Toplevel(dlg)
+            win.title(f"备份内容：{it['name']}")
+            win.configure(bg=BG)
+            win.transient(dlg)
+            win.geometry("760x520")
+            txt = tk.Text(win, bg=CARD, fg=TEXT, font=(FONT_MONO, 9), wrap="none",
+                          padx=10, pady=8)
+            ysb = ttk.Scrollbar(win, orient="vertical", command=txt.yview)
+            xsb = ttk.Scrollbar(win, orient="horizontal", command=txt.xview)
+            txt.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
+            ysb.pack(side="right", fill="y")
+            xsb.pack(side="bottom", fill="x")
+            txt.pack(side="left", fill="both", expand=True)
+            txt.insert("1.0", "\n".join(lines))
+            txt.configure(state="disabled")
+
+        def do_plugin_rm() -> None:
+            it = picked()
+            if not it:
+                return
+            pkgs = simpledialog.askstring(
+                "从备份删除插件",
+                "输入要删除的包名（多个用逗号分隔），对所有 profile 生效：",
+                parent=dlg)
+            if not pkgs:
+                return
+            names = [x.strip() for x in pkgs.replace("，", ",").split(",") if x.strip()]
+            try:
+                path = core.cfg_resolve_backup(cfg, it["name"])
+                result = core.cfg_plugin_remove(path, names, profile="")
+                messagebox.showinfo("配置备份", "已移除：" + "、".join(result["removed"]), parent=dlg)
+                load()
+            except Exception as exc:  # noqa: BLE001
+                messagebox.showerror("配置备份", str(exc), parent=dlg)
+
+        def do_plugin_add() -> None:
+            it = picked()
+            if not it:
+                return
+            manifest = core.cfg_read_manifest(core.cfg_resolve_backup(cfg, it["name"]))
+            profs = [p["name"] for p in manifest.get("profiles") or []]
+            prof = simpledialog.askstring(
+                "往备份加插件",
+                f"加到哪个 profile？（{', '.join(profs)}，不存在会新建）",
+                parent=dlg, initialvalue=profs[0] if profs else "web")
+            if not prof:
+                return
+            spec = simpledialog.askstring(
+                "往备份加插件",
+                "插件 pkg@spec（例如 dsh-foo@1.2.3）。\n"
+                "要连开关/补丁一起带，可从本机某条 lane 采集：pkg@spec@lane名",
+                parent=dlg)
+            if not spec:
+                return
+            from_lane = ""
+            # 简单约定：第三个 @ 后是源 lane（scoped 包 @scope/name@spec@lane）
+            bits = spec.split("@")
+            if spec.startswith("@") and len(bits) >= 4:
+                from_lane = bits[-1].strip()
+                spec = "@" + "@".join(bits[1:-1])
+            elif not spec.startswith("@") and len(bits) >= 3:
+                from_lane = bits[-1].strip()
+                spec = "@".join(bits[:-1])
+            try:
+                path = core.cfg_resolve_backup(cfg, it["name"])
+                result = core.cfg_plugin_add(
+                    path, prof.strip(), [spec.strip()],
+                    src_cfg=core.load_config() if from_lane else None,
+                    src_lane=from_lane, src_profile="")
+                messagebox.showinfo("配置备份", "已加入：" + "、".join(result["added"]), parent=dlg)
+                load()
+            except Exception as exc:  # noqa: BLE001
+                messagebox.showerror("配置备份", str(exc), parent=dlg)
+
+        def do_restore() -> None:
+            it = picked()
+            if not it:
+                return
+            new_name = simpledialog.askstring(
+                "导入到新版本",
+                "新建 lane 的名字（取消则改为询问已有 lane）：",
+                parent=dlg, initialvalue=f"{it['sourceLane']}-imported")
+            target = ""
+            version = ""
+            if new_name is None:
+                target = simpledialog.askstring(
+                    "导入到已有 lane",
+                    f"导入到哪条已有 lane？（{', '.join(sorted((cfg.get('lanes') or {}).keys()))}）",
+                    parent=dlg)
+                if not target:
+                    return
+                target = target.strip()
+                if target not in (cfg.get("lanes") or {}):
+                    messagebox.showwarning("配置备份", f"没有 lane「{target}」", parent=dlg)
+                    return
+            else:
+                new_name = new_name.strip()
+                if not core.LANE_NAME_RE.match(new_name):
+                    messagebox.showwarning("配置备份", "lane 名不合法", parent=dlg)
+                    return
+                if new_name in (cfg.get("lanes") or {}):
+                    messagebox.showwarning("配置备份", f"lane「{new_name}」已存在", parent=dlg)
+                    return
+                version = simpledialog.askstring(
+                    "导入到新版本",
+                    f"装哪个 dsh 版本？（默认备份里的 {it['dshVersion']}）",
+                    parent=dlg, initialvalue=it["dshVersion"])
+                if version is None:
+                    return
+                version = version.strip() or it["dshVersion"]
+            if not messagebox.askyesno(
+                "配置备份",
+                f"开始从「{it['name']}」恢复？\n\n"
+                "· 会联网逐个装回插件（几分钟）\n"
+                "· 会话先另存现状再覆盖；同名设置先留 .bak\n"
+                "· 目标 lane 正在运行会先停掉",
+                parent=dlg,
+            ):
+                return
+            args = argparse.Namespace(
+                backup=it["name"], lane=target or None, new_lane=new_name or "",
+                version=version, profiles=None,
+                no_sessions=False, no_settings=False,
+                no_credentials=not it["credentials"], no_data=False, yes=True)
+            title = f"配置恢复：{new_name or target}"
+            self.run_job(title, lambda: core.cmd_cfg_restore(core.load_config(), args),
+                         on_done=load)
+
+        def do_rm() -> None:
+            it = picked()
+            if not it:
+                return
+            if not messagebox.askyesno(
+                "配置备份", f"删掉「{it['name']}」（{core.human_size(it['bytes'])}）？",
+                parent=dlg,
+            ):
+                return
+            try:
+                core.cfg_resolve_backup(cfg, it["name"]).unlink()
+                load()
+            except Exception as exc:  # noqa: BLE001
+                messagebox.showerror("配置备份", str(exc), parent=dlg)
+
+        ttk.Button(btns, text="关闭", command=dlg.destroy).pack(side="right")
+        ttk.Button(btns, text="新建备份", command=do_backup).pack(side="left")
+        ttk.Button(btns, text="查看内容", command=do_show).pack(side="left", padx=(8, 0))
+        ttk.Button(btns, text="加插件", command=do_plugin_add).pack(side="left", padx=(8, 0))
+        ttk.Button(btns, text="删插件", command=do_plugin_rm).pack(side="left", padx=(8, 0))
+        ttk.Button(btns, text="导入…", command=do_restore).pack(side="left", padx=(8, 0))
+        ttk.Button(btns, text="删除备份", command=do_rm).pack(side="left", padx=(8, 0))
+
     def new_version_dialog(self) -> None:
         dlg = tk.Toplevel(self.root)
         dlg.title("新建版本")
@@ -2709,6 +3986,357 @@ class LauncherApp:
         reg_var.trace_add("write", reload_versions)
         reload_versions()
 
+    # ── 插件库：读取已装插件 / 跨 profile·跨版本迁移 ──────────────────────────
+    def plugin_dialog(self, lane: str | None = None, profile: str | None = None) -> None:
+        """插件库窗口：左边读"这个环境装了哪些插件"，右边把勾中的搬到另一个环境。
+
+        为什么把"读取"和"迁移"放同一个窗口：这两件事本来就是一件事的两半——先看清楚有什么，
+        再决定搬哪些。分开做两个入口，用户还得自己在脑子里对齐"我看到的到底是哪个环境"。
+        """
+        cfg = core.load_config()
+        lanes = [name for name, data in (cfg.get("lanes") or {}).items() if isinstance(data, dict)]
+        if not lanes:
+            messagebox.showinfo("插件库", "还没有任何 lane。先点「＋ 新建版本」。", parent=self.root)
+            return
+        if lane not in lanes:
+            lane = lanes[0]
+        view = core.lane_profiles_view(cfg, lane)
+        if profile not in view:
+            profile = core.default_profile_of(view)
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("插件库 · 读取与迁移")
+        dlg.configure(bg=BORDER)
+        dlg.transient(self.root)
+        width, height = 1040, 720
+        x = self.root.winfo_rootx() + max(0, (self.root.winfo_width() - width) // 2)
+        y = self.root.winfo_rooty() + 40
+        dlg.geometry(f"{width}x{height}+{x}+{y}")
+        dlg.minsize(920, 600)
+
+        # 对话框整块当成"一片玻璃面板"（bg=BORDER 只剩最外一圈当描边）：
+        # 主窗口那种"彩色背景从缝里透出来"的效果在这里做不到——Toplevel 里的普通控件
+        # 都是不透明的，硬凑只会做成半截效果。
+        surf = PANEL
+        shell = tk.Frame(dlg, bg=surf)
+        shell.pack(fill="both", expand=True, padx=1, pady=1)
+
+        state: dict = {
+            "plugins": [], "vars": {}, "status": None,
+            "src_lane": lane, "src_profile": profile,
+        }
+
+        # ── 标题
+        head = tk.Frame(shell, bg=surf)
+        head.pack(fill="x", padx=16, pady=(14, 6))
+        tk.Label(head, text="插件库", bg=surf, fg=TEXT, font=(FONT_UI, 14, "bold")).pack(side="left")
+        tk.Label(head, text="  读取已装插件 · 在 profile / 版本之间搬运", bg=surf, fg=FAINT,
+                 font=(FONT_UI, 9)).pack(side="left", pady=(3, 0))
+
+        body = tk.Frame(shell, bg=surf)
+        body.pack(fill="both", expand=True, padx=16, pady=(0, 6))
+        body.columnconfigure(0, weight=3, minsize=440)
+        body.columnconfigure(1, weight=2, minsize=360)
+        body.rowconfigure(1, weight=1)
+
+        # ── 左：来源 + 插件清单
+        src_bar = tk.Frame(body, bg=surf)
+        src_bar.grid(row=0, column=0, sticky="ew", padx=(0, 12), pady=(0, 6))
+        tk.Label(src_bar, text="来源环境", bg=surf, fg=TEXT, font=(FONT_UI, 10, "bold")).pack(side="left")
+        src_lane_var = tk.StringVar(value=lane)
+        src_prof_var = tk.StringVar(value=profile)
+        src_lane_box = ttk.Combobox(src_bar, textvariable=src_lane_var, values=lanes,
+                                    width=14, state="readonly")
+        src_lane_box.pack(side="left", padx=(8, 4))
+        src_prof_box = ttk.Combobox(src_bar, textvariable=src_prof_var, width=14)
+        src_prof_box.pack(side="left", padx=4)
+        tk.Label(src_bar, text="（可手输新 profile 名）", bg=surf, fg=FAINT,
+                 font=(FONT_UI, 8)).pack(side="left")
+
+        list_wrap = tk.Frame(body, bg=surf)
+        list_wrap.grid(row=1, column=0, sticky="nsew", padx=(0, 12))
+        list_wrap.rowconfigure(0, weight=1)
+        list_wrap.columnconfigure(0, weight=1)
+        # 清单本身是一块卡片（fill="card"）：直接铺在对话框上会是"一片同色的墙"，
+        # 分不出哪块是可滚动的清单。
+        list_panel = GlassPanel(list_wrap, self, radius=CARD_RADIUS,
+                                pad=CARD_RADIUS + SHADOW_PAD, fill="card", body_window=False)
+        list_panel.grid(row=0, column=0, sticky="nsew")
+        list_canvas = list_panel
+        list_sb = ttk.Scrollbar(list_wrap, orient="vertical", command=list_canvas.yview)
+        list_sb.grid(row=0, column=1, sticky="ns", padx=(4, 0))
+        list_canvas.configure(yscrollcommand=list_sb.set)
+        list_inner = tk.Frame(list_canvas, bg=CARD)
+        list_item = list_canvas.create_window(CARD_RADIUS + SHADOW_PAD, CARD_RADIUS + SHADOW_PAD,
+                                              anchor="nw", window=list_inner)
+
+        def sync_list_panel() -> None:
+            try:
+                inner_w = max(120, list_canvas.winfo_width() - 2 * (CARD_RADIUS + SHADOW_PAD))
+                list_canvas.itemconfigure(list_item, width=inner_w)
+                list_canvas.configure(scrollregion=list_canvas.bbox("all") or (0, 0, 0, 0))
+            except tk.TclError:
+                return
+            list_panel.refresh_bg()
+
+        list_canvas.bind("<Configure>", lambda _e: sync_list_panel())
+        list_inner.bind("<Configure>", lambda _e: sync_list_panel())
+        # 不用 bind_all：那会把主窗口的滚轮绑定顶掉，关掉这个窗口后主窗口就滚不动了
+        for target in (list_canvas, list_inner):
+            target.bind("<MouseWheel>", lambda e, c=list_canvas: self._wheel_on(c, e))
+
+        pick_bar = tk.Frame(shell, bg=surf)
+        pick_bar.pack(fill="x", padx=16, pady=(4, 10))
+        state["status"] = tk.Label(pick_bar, text="", bg=surf, fg=MUTED, font=(FONT_UI, 9))
+        state["status"].pack(side="left")
+
+        # ── 右：目标 + 方式 + 计划
+        dst_bar = tk.Frame(body, bg=surf)
+        dst_bar.grid(row=0, column=1, sticky="ew", pady=(0, 6))
+        tk.Label(dst_bar, text="目标环境", bg=surf, fg=TEXT,
+                 font=(FONT_UI, 10, "bold")).pack(side="left")
+        dst_lane_var = tk.StringVar(value=lanes[0])
+        dst_prof_var = tk.StringVar(value=core.DEFAULT_PROFILE)
+        dst_lane_box = ttk.Combobox(dst_bar, textvariable=dst_lane_var, values=lanes,
+                                    width=14, state="readonly")
+        dst_lane_box.pack(side="left", padx=(8, 4))
+        dst_prof_box = ttk.Combobox(dst_bar, textvariable=dst_prof_var, width=14)
+        dst_prof_box.pack(side="left", padx=4)
+        tk.Label(dst_bar, text="（可手输新 profile 名）", bg=surf, fg=FAINT,
+                 font=(FONT_UI, 8)).pack(side="left")
+
+        mode_var = tk.StringVar(value="install")
+        mode_box = tk.Frame(body, bg=surf)
+        mode_box.grid(row=1, column=1, sticky="new")
+        tk.Label(mode_box, text="搬运方式", bg=surf, fg=TEXT,
+                 font=(FONT_UI, 10, "bold")).pack(anchor="w")
+        for value, text, note in (
+            ("install", "重新安装（点名到同版本）",
+             "走 dsh 自己的 plugin 命令，pnpm 账本干净；跨版本对不上会明确报错。需要能连上源。"),
+            ("copy", "离线直拷（不联网 / 不用 node）",
+             "把插件连同依赖整棵复制过去，链接按目标路径重建；pnpm 账本不会同步。"),
+        ):
+            tk.Radiobutton(mode_box, text=text, value=value, variable=mode_var, bg=surf, fg=TEXT,
+                           selectcolor=CARD, activebackground=surf, activeforeground=TEXT,
+                           font=(FONT_UI, 9), highlightthickness=0, cursor="hand2").pack(anchor="w")
+            tk.Label(mode_box, text=note, bg=surf, fg=FAINT, font=(FONT_UI, 8), justify="left",
+                     wraplength=340).pack(anchor="w", padx=(22, 0), pady=(0, 2))
+
+        tk.Label(mode_box, text="计划预览", bg=surf, fg=TEXT,
+                 font=(FONT_UI, 10, "bold")).pack(anchor="w", pady=(10, 4))
+        preview = tk.Text(mode_box, height=10, width=1, bg=CARD, fg=TEXT, relief="flat",
+                          wrap="word", font=(FONT_MONO, 8), padx=8, pady=6,
+                          highlightthickness=1, highlightbackground=mix(CARD, BORDER, 0.7),
+                          state="disabled")
+        preview.pack(fill="both", expand=True)
+
+        def set_preview(lines: list[tuple[str, str | None]]) -> None:
+            preview.configure(state="normal")
+            preview.delete("1.0", "end")
+            for text, tag in lines:
+                preview.insert("end", text + "\n",
+                               {"ok": "ok", "err": "err", "warn": "warn", "muted": "muted"}.get(tag or "", ""))
+            preview.configure(state="disabled")
+        for tag, color in (("ok", GREEN), ("err", RED), ("warn", AMBER), ("muted", MUTED)):
+            preview.tag_configure(tag, foreground=color)
+
+        # ── 渲染插件清单
+        def render_plugins(plugins: list[dict], error: str = "") -> None:
+            for child in list_inner.winfo_children():
+                child.destroy()
+            state["plugins"] = plugins
+            state["vars"] = {}
+            if error:
+                tk.Label(list_inner, text=error, bg=CARD, fg=RED, font=(FONT_UI, 9),
+                         justify="left", wraplength=380).pack(anchor="w", pady=4)
+                return
+            if not plugins:
+                tk.Label(list_inner, text="这个环境没有第三方插件（只有官方组合包）。",
+                         bg=CARD, fg=FAINT, font=(FONT_UI, 9)).pack(anchor="w", pady=4)
+                return
+            for item in plugins:
+                row = tk.Frame(list_inner, bg=CARD)
+                row.pack(fill="x", pady=2)
+                var = tk.BooleanVar(value=False)
+                state["vars"][item["pkg"]] = var
+                tk.Checkbutton(row, variable=var, bg=CARD, activebackground=CARD,
+                               selectcolor=INPUT_BG, highlightthickness=0,
+                               cursor="hand2").pack(side="left")
+                text = tk.Frame(row, bg=CARD)
+                text.pack(side="left", fill="x", expand=True)
+                head_row = tk.Frame(text, bg=CARD)
+                head_row.pack(anchor="w")
+                tk.Label(head_row, text=item["pkg"], bg=CARD, fg=TEXT,
+                         font=(FONT_UI, 9, "bold")).pack(side="left")
+                tk.Label(head_row, text=f"  {item['version'] or '?'}", bg=CARD, fg=MUTED,
+                         font=(FONT_MONO, 8)).pack(side="left")
+                if item["rows"] and len(item["disabled_rows"]) == len(item["rows"]):
+                    chip, chip_bg, chip_fg = "已禁用", GREEN_BG, GREEN
+                elif item["disabled_rows"]:
+                    chip, chip_bg, chip_fg = f"部分禁用 {len(item['disabled_rows'])}/{len(item['rows'])}", AMBER_BG, AMBER
+                else:
+                    chip, chip_bg, chip_fg = "启用中", GRAY_BG, MUTED
+                tk.Label(head_row, text=f"  {chip}", bg=chip_bg, fg=chip_fg,
+                         font=(FONT_UI, 8), padx=6, pady=1).pack(side="left", padx=(6, 0))
+                if item["kind"] == "client-only":
+                    tk.Label(head_row, text="  纯客户端", bg=GRAY_BG, fg=MUTED,
+                             font=(FONT_UI, 8), padx=6, pady=1).pack(side="left", padx=(4, 0))
+                if not item["in_bundles"]:
+                    tk.Label(head_row, text="  未登记为组合包", bg=GRAY_BG, fg=MUTED,
+                             font=(FONT_UI, 8), padx=6, pady=1).pack(side="left", padx=(4, 0))
+                tk.Label(text, text="行 id：" + ("、".join(item["rows"]) or "（无）"),
+                         bg=CARD, fg=FAINT, font=(FONT_UI, 8), anchor="w",
+                         justify="left").pack(anchor="w")
+            state["status"].configure(text=f"共 {len(plugins)} 个第三方插件")
+
+        def load_source() -> None:
+            src_lane = src_lane_var.get().strip()
+            src_prof = src_prof_var.get().strip() or core.DEFAULT_PROFILE
+            view_local = core.lane_profiles_view(core.load_config(), src_lane)
+            src_prof_box.configure(values=sorted(view_local))
+            state["src_lane"], state["src_profile"] = src_lane, src_prof
+            state["status"].configure(text="正在读取插件…")
+
+            def work() -> None:
+                try:
+                    plugins = core.profile_plugins(core.load_config(), src_lane, src_prof)
+                    err = ""
+                except Exception as exc:  # noqa: BLE001
+                    plugins, err = [], f"{type(exc).__name__}: {exc}"
+                self.root.after(0, lambda: render_plugins(plugins, err))
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def load_target_profiles(*_a) -> None:
+            dst = dst_lane_var.get().strip()
+            view_local = core.lane_profiles_view(core.load_config(), dst)
+            dst_prof_box.configure(values=sorted(view_local))
+
+        def picked() -> list[str]:
+            return [pkg for pkg, var in state["vars"].items() if var.get()]
+
+        def build_plan() -> dict | None:
+            pkgs = picked()
+            if not pkgs:
+                set_preview([("先在左边勾选要搬的插件。", "muted")])
+                return None
+            plan = core.plugin_transfer_plan(
+                core.load_config(), state["src_lane"], state["src_profile"],
+                dst_lane_var.get().strip(), dst_prof_var.get().strip() or core.DEFAULT_PROFILE,
+                pkgs, mode_var.get())
+            lines: list[tuple[str, str | None]] = []
+            if not plan["ok"]:
+                lines.append((f"不能搬：{plan['why']}", "err"))
+                set_preview(lines)
+                return None
+            lines.append((f"源   {state['src_lane']}/{state['src_profile']}", "muted"))
+            lines.append((f"目标 {dst_lane_var.get().strip()}/"
+                          f"{dst_prof_var.get().strip() or core.DEFAULT_PROFILE}"
+                          + ("" if plan["dst"]["onDisk"] else "（磁盘上还没有，会先建一个干净环境）"),
+                          "muted"))
+            lines.append((f"方式 {'重新安装（点名到同版本）' if mode_var.get() == 'install' else '离线直拷'}", "muted"))
+            lines.append(("", None))
+            for item in plan["items"]:
+                text = f"· {item['pkg']}  {item['version'] or '?'} → {item['want']}"
+                if item["why"]:
+                    text += f"   （{item['why']}）"
+                lines.append((text, "ok" if item["version"] else None))
+            for line in plan["warnings"]:
+                lines.append((f"注意  {line}", "warn"))
+            set_preview(lines)
+            return plan
+
+        def do_transfer() -> None:
+            plan = build_plan()
+            if plan is None:
+                return
+            pkgs = picked()
+            src_lane = state["src_lane"]
+            src_prof = state["src_profile"]
+            dst_lane = dst_lane_var.get().strip()
+            dst_prof = dst_prof_var.get().strip() or core.DEFAULT_PROFILE
+            mode = mode_var.get()
+            if not messagebox.askyesno(
+                "开始搬运",
+                f"把 {len(pkgs)} 个插件从 {src_lane}/{src_prof} "
+                f"搬到 {dst_lane}/{dst_prof}？\n\n"
+                f"方式：{'重新安装（点名到同版本）' if mode == 'install' else '离线直拷'}\n"
+                "会写目标 profile 的 node_modules / package.json / cordis.patch.yml"
+                "（改动前先留 .bak）。",
+                parent=dlg,
+            ):
+                return
+            start_btn.configure(state="disabled")
+            set_preview([("正在搬运…详细过程看主窗口的实时日志。", "muted")])
+
+            def job() -> None:
+                core.transfer_plugins(core.load_config(), src_lane, src_prof,
+                                      dst_lane, dst_prof, pkgs, mode)
+
+            def done() -> None:
+                try:
+                    start_btn.configure(state="normal")
+                except tk.TclError:
+                    return
+                load_source()
+
+            self.run_job(f"搬运插件 → {dst_lane}/{dst_prof}", job, on_done=done)
+
+        def overview() -> None:
+            def job() -> None:
+                rows = core.plugin_inventory(core.load_config())
+                core.info(core.col("── 插件总览（只读）──", core.C.BOLD))
+                for row in rows:
+                    core.info(f"  {row['lane']}/{row['profile']}   v{row['version']}"
+                              f"   第三方插件 {len(row['plugins'])} 个"
+                              + ("（磁盘上没有）" if not row["onDisk"] else ""))
+                    if row["error"]:
+                        core.warn(f"      读取失败：{row['error']}")
+                        continue
+                    for item in row["plugins"]:
+                        core.info(core.col(f"      {item['pkg']}  {item['version'] or '?'}"
+                                           f"  [{item['kind']}]", core.C.GRAY))
+
+            self.run_job("插件总览", job)
+
+        # ── 按钮
+        btns = tk.Frame(mode_box, bg=surf)
+        btns.pack(fill="x", pady=(10, 0))
+        start_btn = self.button(btns, "开始搬运", do_transfer, primary=True)
+        start_btn.pack(side="right")
+        self.button(btns, "预览计划", build_plan).pack(side="right", padx=6)
+        self.button(btns, "关闭", dlg.destroy).pack(side="right", padx=6)
+
+        self.button(pick_bar, "全选", lambda: [v.set(True) for v in state["vars"].values()]).pack(side="right")
+        self.button(pick_bar, "全不选", lambda: [v.set(False) for v in state["vars"].values()]).pack(
+            side="right", padx=6)
+        self.button(pick_bar, "总览全部环境", overview).pack(side="right", padx=6)
+        self.button(pick_bar, "重新读取", load_source, primary=True).pack(side="right", padx=6)
+
+        src_lane_box.bind("<<ComboboxSelected>>", lambda _e: load_source())
+        src_prof_box.bind("<<ComboboxSelected>>", lambda _e: load_source())
+        src_prof_box.bind("<Return>", lambda _e: load_source())
+        dst_lane_box.bind("<<ComboboxSelected>>", lambda _e: load_target_profiles())
+        mode_var.trace_add("write", lambda *_: build_plan())
+
+        # 打开时先把两个下拉填好，再读一次来源
+        load_source()
+        load_target_profiles()
+        try:
+            dst_prof_box.set(core.DEFAULT_PROFILE)
+        except tk.TclError:
+            pass
+        dlg.after(120, sync_list_panel)
+        dlg.after(160, lambda: self.log("插件库：读的是磁盘真值（不跑 --dump-config），所以是即时的。",
+                                        "muted"))
+
+    @staticmethod
+    def _wheel_on(canvas: tk.Canvas, event) -> None:
+        try:
+            canvas.yview_scroll(int(-event.delta / 120) or (-1 if event.delta > 0 else 1), "units")
+        except tk.TclError:
+            pass
+
     # ── 关闭 ────────────────────────────────────────────────────────────────
     def _save_geometry(self) -> None:
         try:
@@ -2716,7 +4344,10 @@ class LauncherApp:
             if w < 400 or h < 300:  # 最小化/异常状态下不记
                 return
             cfg = core.load_config()
-            cfg["ui"] = {"w": w, "h": h, "x": self.root.winfo_x(), "y": self.root.winfo_y()}
+            ui = dict(cfg.get("ui") or {})     # 保留 theme 等其它字段，别把整块覆盖掉
+            ui.update({"w": w, "h": h, "x": self.root.winfo_x(), "y": self.root.winfo_y(),
+                       "theme": THEME_NAME})
+            cfg["ui"] = ui
             core.save_config(cfg)
         except Exception:
             pass
@@ -2782,6 +4413,12 @@ _REQUIRED_ACTIONS = (
     "market_dialog",
     "chat_dialog",
     "new_version_dialog",
+    "plugin_dialog",
+    "toggle_theme",
+    "rebuild_ui",
+    "sync_glass",
+    "_add_list_item",
+    "_finish_list",
     "registry_row",
     "_save_registry_choice",
     "_attach_port_hint",

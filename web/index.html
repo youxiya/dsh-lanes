@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#e8ecf6">
+<!-- 内联 data: 空地址 = 不去请求 /favicon.ico（否则控制台会多一条 404） -->
+<link rel="icon" href="data:,">
+<title>DSH 多版本启动器</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<!-- 极光背景：两层叠着（浅色 / 深色），换主题时靠不透明度交叉淡入 -->
+<div class="aurora" aria-hidden="true">
+  <div class="layer" data-t="light">
+    <span class="blob b1"></span><span class="blob b2"></span><span class="blob b3"></span>
+    <span class="blob b4"></span><span class="blob b5"></span>
+  </div>
+  <div class="layer" data-t="dark">
+    <span class="blob b1"></span><span class="blob b2"></span><span class="blob b3"></span>
+    <span class="blob b4"></span><span class="blob b5"></span>
+  </div>
+</div>
+
+<div class="shell">
+
+  <header class="head glass">
+    <div class="head-main">
+      <h1>DSH 多版本启动器 <small>多版本 · 多环境 · 插件自由搬</small></h1>
+      <p class="sub">一条 lane＝一个版本（独立安装树 + HOME）；版本内可开多个 profile 环境；端口每次启动实时挑空闲</p>
+      <p class="remote pending" id="remote">
+        <span id="remote-text">正在查询 npm 上的最新版本…</span>
+        <button class="link" id="repo-link" type="button">官方代码库 ↗</button>
+      </p>
+    </div>
+    <div class="head-actions">
+      <div class="row">
+        <button class="btn primary" type="button" id="btn-new">＋ 新建版本</button>
+        <button class="btn" type="button" id="btn-refresh">刷新</button>
+        <button class="btn" type="button" id="btn-plugins">插件库</button>
+        <button class="btn" type="button" id="btn-cfg">配置备份</button>
+      </div>
+      <div class="row">
+        <button class="btn" type="button" id="btn-root">打开根目录</button>
+        <button class="btn danger" type="button" id="btn-stop-all">全部停止</button>
+        <button class="btn" type="button" id="btn-doctor">环境自检</button>
+        <button class="btn" type="button" id="btn-theme">深色模式</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="body">
+
+    <section class="col col-list glass">
+      <div class="col-head">
+        <h2>版本与环境</h2>
+        <span class="spacer"></span>
+        <span class="prof-note">端口留空＝自动挑空闲</span>
+      </div>
+      <div class="col-cards" id="lane-scroll">
+        <div id="lane-cards">
+          <div class="skel"></div>
+          <div class="skel"></div>
+          <div class="skel"></div>
+        </div>
+        <div id="extra"></div>
+      </div>
+    </section>
+
+    <section class="col col-log glass">
+      <div class="col-head">
+        <h2>实时日志</h2>
+        <span class="spacer"></span>
+        <label class="link muted" for="follow"><input type="checkbox" id="follow" checked> 跟随</label>
+        <button class="btn small" type="button" id="btn-log-clear">清空</button>
+        <button class="btn small" type="button" id="btn-log-copy">复制全部</button>
+      </div>
+      <div class="log-wrap">
+        <pre id="log" tabindex="0" aria-live="polite"></pre>
+        <button class="btn small jump" type="button" id="btn-log-jump" hidden>回到最新 ↓</button>
+      </div>
+    </section>
+
+  </main>
+
+  <footer class="status glass">
+    <span id="status">就绪</span>
+    <span class="spacer"></span>
+    <span class="busy" id="busy"></span>
+    <span class="counts" id="counts"></span>
+  </footer>
+
+</div>
+
+<div class="toasts" id="toasts" popover="manual" aria-live="polite"></div>
+
+<div class="fps" id="fps" hidden></div>
+
+<div class="boot" id="boot">
+  <div class="spinner"></div>
+  <div id="boot-text">正在连接启动器服务…</div>
+  <div class="boot-hint" id="boot-hint">界面通过本机回环地址与后端通信，不会联网。</div>
+</div>
+
+<dialog class="modal" id="modal">
+  <div class="modal-head" id="modal-head">确认</div>
+  <div class="modal-body" id="modal-body"></div>
+  <div class="modal-foot">
+    <button class="btn" type="button" id="modal-cancel">取消</button>
+    <button class="btn primary" type="button" id="modal-ok">确定</button>
+  </div>
+</dialog>
+
+<noscript>
+  <div class="empty nojs">
+    <h3>这个界面需要 JavaScript</h3>
+    <p>要用不依赖浏览器的界面，请运行　py dsh_lanes_web.py --classic　或　py dsh_lanes_gui.py</p>
+  </div>
+</noscript>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

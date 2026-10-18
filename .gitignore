@@ -26,3 +26,8 @@ run/
 .idea/
 Thumbs.db
 desktop.ini
+
+# Codely AI local tooling / Windows shortcuts
+.codely-cli/
+CODELY.md
+*.lnk

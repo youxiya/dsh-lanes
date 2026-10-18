@@ -64,9 +64,11 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
+import zipfile
 import urllib.parse
 import urllib.request
 import webbrowser
@@ -2965,7 +2967,7 @@ def _manifest_version(path) -> str | None:
         return None
 
 
-def copy_tree(src: Path, dst: Path, on_progress=None) -> dict:
+def copy_tree(src: Path, dst: Path, on_progress=None, skip: set | None = None) -> dict:
     """把 src 整棵复制到 dst。
 
     规则（三条，缺一条就会静默出错）：
@@ -2978,7 +2980,7 @@ def copy_tree(src: Path, dst: Path, on_progress=None) -> dict:
          事后用 `verify` 核对它到底指对了没有。
       3. 单条失败不中断整棵复制，但会记进 errors —— 有 error 的副本不可信，上层必须报错。
     """
-    stats = {"files": 0, "dirs": 0, "bytes": 0, "links": 0, "errors": []}
+    stats = {"files": 0, "dirs": 0, "bytes": 0, "links": 0, "errors": [], "skipped": []}
     stack = [(Path(src), Path(dst))]
     while stack:
         s, d = stack.pop()
@@ -2996,6 +2998,11 @@ def copy_tree(src: Path, dst: Path, on_progress=None) -> dict:
         for entry in entries:
             sp = Path(entry.path)
             dp = d / entry.name
+            if skip and sp in skip:
+                # 明确跳过的子树（例如"只复制选中的 profile"里没选的那些目录）：
+                # 既不建目录也不进去 —— 留个空壳会让 DSH 以为这个 profile 存在
+                stats["skipped"].append(str(sp))
+                continue
             if _is_reparse(sp):
                 stats["links"] += 1
                 continue
@@ -3155,8 +3162,15 @@ def _merge_relink(*results: dict) -> dict:
     return total
 
 
-def lane_clone_plan(cfg: dict, src: str, new: str, sizes: bool = True) -> dict:
-    """算出一条 lane 的复制方案：装到哪、从哪来、多大、空间够不够、有没有硬问题。"""
+def lane_clone_plan(cfg: dict, src: str, new: str, sizes: bool = True,
+                    profiles: list[str] | None = None) -> dict:
+    """算出一条 lane 的复制方案：装到哪、从哪来、多大、空间够不够、有没有硬问题。
+
+    `profiles` 只列要一起复制的 profile（HOME\\profiles\\<名>）；`None` ＝全部。
+    为什么要能挑：一条 lane 的 HOME 里常常开着好几个环境，体积主要在 profile 的
+    node_modules 上（实测一条 lane 的 HOME 是 628 MB），而"试升级"往往只关心其中一个。
+    没选的 profile **不进副本**（不是复制完再删），所以体积也照着选中的算。
+    """
     data = cfg["lanes"][src]
     p = ensure_layout(cfg)
     src_home = Path(data.get("home") or (p["homes"] / src))
@@ -3170,6 +3184,12 @@ def lane_clone_plan(cfg: dict, src: str, new: str, sizes: bool = True) -> dict:
     dst_install = p["clones"] / new
     dst_pkg = dst_install / "node_modules" / "@deepseek-ai" / "dsh"
     dst_root = dst_pkg if src_root == src_pkg else dst_install
+    on_disk = sorted(disk_profiles(src_home))
+    if profiles is None:
+        chosen = list(on_disk)
+    else:
+        wanted = [str(name).strip() for name in profiles if str(name).strip()]
+        chosen = [name for name in wanted if name in on_disk]
     plan = {
         "src": src,
         "src_version": str(data.get("version") or "?"),
@@ -3181,7 +3201,11 @@ def lane_clone_plan(cfg: dict, src: str, new: str, sizes: bool = True) -> dict:
         "install": dst_install,
         "pkg": dst_pkg,
         "root": dst_root,
+        "profiles": on_disk,
+        "profiles_selected": chosen,
+        "profiles_skipped": [name for name in on_disk if name not in chosen],
         "home_size": None,
+        "home_size_all": None,
         "install_size": None,
         "free": None,
         "problems": [],
@@ -3194,9 +3218,21 @@ def lane_clone_plan(cfg: dict, src: str, new: str, sizes: bool = True) -> dict:
         plan["problems"].append(f"目标 DSH_HOME 已存在：{plan['home']}")
     if plan["install"].exists():
         plan["problems"].append(f"目标安装目录已存在：{plan['install']}")
+    if profiles is not None:
+        unknown = [str(name).strip() for name in profiles
+                   if str(name).strip() and str(name).strip() not in on_disk]
+        if unknown:
+            plan["problems"].append(
+                f"源 lane 的 HOME 里没有这些 profile：{'、'.join(unknown)}"
+                f"（磁盘上现有：{'、'.join(on_disk) or '无'}）")
     if sizes:
-        plan["home_size"] = dir_size(src_home)
         plan["install_size"] = dir_size(src_install)
+        plan["home_size_all"] = dir_size(src_home)
+        # 没选的 profile 不会进副本，体积从总量里扣掉（profiles 那棵子树是 HOME 的子集，
+        # dir_size 不跟 junction，所以直接相减是准的）
+        skipped_size = sum(dir_size(src_home / "profiles" / name)
+                           for name in plan["profiles_skipped"])
+        plan["home_size"] = max(0, plan["home_size_all"] - skipped_size)
         try:
             base = plan["install"] if plan["install"].exists() else Path(cfg["root"])
             plan["free"] = shutil.disk_usage(str(base)).free
@@ -3292,7 +3328,19 @@ def cmd_clone(cfg: dict, args) -> int:
         fail("lane 名只允许字母 / 数字 / . _ - （1-32 字符）")
         return 1
 
-    plan = lane_clone_plan(cfg, src, new, sizes=True)
+    raw = getattr(args, "profiles", None)
+    if isinstance(raw, str):
+        wanted: list[str] | None = [part.strip() for part in raw.split(",") if part.strip()]
+    elif raw:
+        wanted = [str(part).strip() for part in raw if str(part).strip()]
+    else:
+        wanted = None
+
+    plan = lane_clone_plan(cfg, src, new, sizes=True, profiles=wanted)
+    if plan["profiles"] and not plan["profiles_selected"]:
+        fail(f"一个 profile 都没选 —— 源 lane 的 HOME 里有 {'、'.join(plan['profiles'])}，"
+             "至少留一个（不指定 --profiles 就是全复制）")
+        return 1
     if plan["problems"]:
         for item in plan["problems"]:
             fail(item)
@@ -3305,6 +3353,11 @@ def cmd_clone(cfg: dict, args) -> int:
     info(f"  待复制      : 安装树 {human_size(plan['install_size'] or 0)}"
          f" + HOME {human_size(plan['home_size'] or 0)}"
          f" ≈ {human_size(need)}")
+    if plan["profiles"]:
+        info(f"  profiles    : 复制 {'、'.join(plan['profiles_selected']) or '（无）'}"
+             + (f"　·　跳过 {'、'.join(plan['profiles_skipped'])}"
+                f"（整份 HOME 是 {human_size(plan['home_size_all'] or 0)}）"
+                if plan["profiles_skipped"] else "（全部）"))
     if plan["free"]:
         info(f"  目标盘剩余  : {human_size(plan['free'])}")
         if need > plan["free"]:
@@ -3333,7 +3386,10 @@ def cmd_clone(cfg: dict, args) -> int:
     write_lane_package_json(plan["install"], plan["src_version"], cfg.get("allow_scripts") or {})
 
     info(col("  [2/4] 复制 DSH_HOME（会话 / 设置 / 已装插件）…", C.CYAN))
-    st_home = copy_tree(plan["src_home"], plan["home"], on_progress=lambda s: progress(s, "HOME"))
+    # 没选中的 profile 不进副本：不是"复制完再删"，而是压根不进去（省时间也省空间）
+    skip_dirs = {plan["src_home"] / "profiles" / name for name in plan["profiles_skipped"]}
+    st_home = copy_tree(plan["src_home"], plan["home"],
+                        on_progress=lambda s: progress(s, "HOME"), skip=skip_dirs)
 
     info(col("  [3/4] 重建 junction（安装树 + HOME，全部重定向到副本自己的路径）…", C.CYAN))
     pairs = [
@@ -3349,7 +3405,6 @@ def cmd_clone(cfg: dict, args) -> int:
              f"（重定向 {rel['remapped']} 个，源里已悬空跳过 {rel['dangling']} 个）", C.GRAY))
 
     info(col("  [4/4] 登记新 lane…", C.CYAN))
-    src_view = lane_profiles_view(cfg, src)
     cfg["lanes"][new] = {
         "version": plan["src_version"],
         "home": str(plan["home"]),
@@ -3358,10 +3413,11 @@ def cmd_clone(cfg: dict, args) -> int:
         "clonedFrom": src,
         "createdAt": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
-    if src_view:
-        # HOME 里的 profile 目录已经整棵复制过来了，把名字也登记上（端口偏好不带：新环境重新挑）
+    if plan["profiles_selected"]:
+        # HOME 里**选中**的 profile 目录已经复制过来了，把名字也登记上（端口偏好不带：新环境重新挑）
         cfg["lanes"][new]["profiles"] = {
-            name: {"createdAt": time.strftime("%Y-%m-%d %H:%M:%S")} for name in sorted(src_view)
+            name: {"createdAt": time.strftime("%Y-%m-%d %H:%M:%S")}
+            for name in plan["profiles_selected"]
         }
     save_config(cfg)
 
@@ -3373,8 +3429,12 @@ def cmd_clone(cfg: dict, args) -> int:
     info(f"      安装目录  : {plan['install']}")
     info(f"      DSH_HOME  : {plan['home']}")
     info(col("      端口      : 启动时实时挑空闲端口", C.GRAY))
-    if src_view:
-        info(col(f"      profiles  : {'、'.join(sorted(src_view))}（随 HOME 一起复制过来了）", C.GRAY))
+    if plan["profiles_selected"]:
+        info(col(f"      profiles  : {'、'.join(plan['profiles_selected'])}"
+                 "（随 HOME 复制过来了）", C.GRAY))
+    if plan["profiles_skipped"]:
+        info(col(f"                  没复制的：{'、'.join(plan['profiles_skipped'])}"
+                 "（需要时在新 lane 上点「＋ 添加 Profile」再建）", C.GRAY))
     info(f"      复制内容  : {st_install['files'] + st_home['files']} 个文件 / "
          f"{human_size(st_install['bytes'] + st_home['bytes'])}，用时 {elapsed:.1f}s")
     info(f"      会话文件  : {count_sessions(plan['home'])} 个"
@@ -4912,6 +4972,694 @@ def plugin_overview(cfg: dict, lane: str, profile: str = PROFILE_NAME,
     }
 
 
+# ================= 插件清单 / 插件跨 profile·跨版本迁移（plugin-transfer） =================
+#
+# 真实需求：一条 lane 里可以开多个 profile（多环境），每个 profile 有自己的一套插件组合。
+# "这套环境里已经装好的插件，原样搬到另一个环境 / 另一个版本" 是日常动作，所以单独做一条路。
+#
+# 两种搬法，代价与可信度完全不同，界面上让用户选：
+#
+#   install —— 读源里插件的**实际版本号**，在目标 profile 用 dsh 自己的 plugin 命令
+#              点名到那个版本装一遍。链接、store、账本全部由 pnpm 自己建，装完就是一份
+#              干净的目标环境；跨版本时依赖对不上会**明确报错**（这正是我们要的结果，
+#              而不是"看起来搬过去了，启动才发现没生效"）。
+#   copy    —— 离线直拷：把该插件在源 profile 里的**依赖闭包**整棵复制过去，链接按目标
+#              路径重建。不需要网络，也不需要 node 在 PATH 里。代价是 pnpm 账本
+#              （pnpm-lock.yaml）不会同步，之后在目标里装别的东西时 pnpm 可能要重新解析一次。
+#              所以复制完必须逐条报清楚"哪些包复制上了、哪些没有"，不能假装成功。
+#
+# 两种方式都要补三样东西，缺一样插件都不会真的生效：
+#   ① 目标 profile 的 package.json：dependencies 里要有这个包；
+#   ② dsh.profile.bundles 里要有它——这是宿主真正加载的组合包清单，只装不登记不会加载；
+#   ③ 补丁层：把源里针对这些插件**行 id** 的覆盖条目搬过去，否则"源里关掉的插件"
+#      搬过去会变回开启（补丁是环境状态的一部分）。
+
+PLUGIN_TRANSFER_MODES = ("install", "copy")
+
+
+def installed_pkg_dir(home, pkg: str, profile: str = PROFILE_NAME) -> Path:
+    return profile_dir(home, profile) / "node_modules" / pkg
+
+
+def installed_pkg_version(home, pkg: str, profile: str = PROFILE_NAME) -> str | None:
+    """这个包在 profile 里**实际装上**的版本：读它自己的 package.json。
+
+    不是清单里写的范围——`^1.2.0` 说明不了装的是哪一个；翻版本时靠的是这个值。
+    """
+    return _manifest_version(installed_pkg_dir(home, pkg, profile))
+
+
+def profile_plugins(cfg: dict, lane: str, profile: str = PROFILE_NAME,
+                    include_official: bool = False) -> list[dict]:
+    """这个 profile 装了哪些插件（**文件真值**，毫秒级，不跑 --dump-config）。"""
+    listing = plugin_listing(cfg, lane, profile)
+    home = listing["home"]
+    out: list[dict] = []
+    for item in listing["bundles"]:
+        if item["official"] and not include_official:
+            continue
+        out.append({
+            "pkg": item["pkg"],
+            "spec": item["spec"],
+            "version": installed_pkg_version(home, item["pkg"], profile) or "",
+            "kind": item["kind"],
+            "official": item["official"],
+            "in_bundles": item["in_bundles"],
+            "rows": list(item["rows"]),
+            "disabled_rows": list(item["disabled_rows"]),
+            "protected": item["protected"],
+            "skipped": item["skipped"],
+            "installed": item["installed"],
+        })
+    return out
+
+
+def plugin_inventory(cfg: dict) -> list[dict]:
+    """本启动器管的**全部** lane × profile 的插件清单（界面「插件总览」用）。只读。"""
+    rows: list[dict] = []
+    for lane in sorted(cfg.get("lanes", {})):
+        data = cfg["lanes"].get(lane) or {}
+        view = lane_profiles_view(cfg, lane)
+        for prof in sorted(view):
+            entry = {
+                "lane": lane,
+                "profile": prof,
+                "version": data.get("version") or "?",
+                "kind": data.get("kind") or "",
+                "onDisk": bool(view[prof].get("onDisk")),
+                "error": "",
+                "plugins": [],
+            }
+            try:
+                entry["plugins"] = profile_plugins(cfg, lane, prof)
+            except Exception as exc:  # noqa: BLE001
+                entry["error"] = f"{type(exc).__name__}: {exc}"
+            rows.append(entry)
+    return rows
+
+
+def _backup_file(path: Path) -> str:
+    """改一份清单/补丁层之前先留一份 `.bak`（和凭据、pnpm 账本一个规矩）。"""
+    try:
+        if path.is_file():
+            bak = path.with_name(path.name + ".bak")
+            shutil.copyfile(path, bak)
+            return str(bak)
+    except OSError:
+        pass
+    return ""
+
+
+def _declared_deps(pkg_dir: Path) -> list[str]:
+    """这个包声明了哪些运行时依赖（dependencies + optionalDependencies）。"""
+    try:
+        data = json.loads((pkg_dir / "package.json").read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    names = dict(data.get("dependencies") or {})
+    names.update(data.get("optionalDependencies") or {})
+    return list(names)
+
+
+def _resolve_nm(src_pdir: Path, from_dir: Path, pkg: str) -> Path | None:
+    """在源 profile 里找 pkg 落在哪：先看包自己旁边的 node_modules，再看顶层（hoisted 的位置）。"""
+    for base in (from_dir / "node_modules", src_pdir / "node_modules"):
+        cand = base / pkg
+        try:
+            if cand.exists():
+                return cand
+        except OSError:
+            continue
+    return None
+
+
+def _plugin_closure(src_pdir: Path, pkgs: list[str]) -> tuple[list[str], list[str], list[str], list[str]]:
+    """算出"要复制过去"的目录：返回 (要复制内容的相对目录, 走不到的包, 指向 profile 外的包, 涉及的全部包名)。
+
+    只跟 **dependencies** 走，不跟 peerDependencies：本机 profile 用 hoisted 链接器
+    （pnpm-workspace.yaml 里写死的），依赖被提升到 `node_modules` 顶层，所以闭包很浅；
+    peer 是宿主提供的（dsh 自己），本来就不该复制。
+
+    为什么要返回**包名**：`node_modules/<名>` 这一层在 hoisted 链接器下常常是 junction，
+    而 junction 的内容（真实目录）在 `.pnpm/...` 里——复制了内容之后，这一层的入口链接
+    还得**按目标路径重新建回来**，否则依赖解析会在目标里直接 `MODULE_NOT_FOUND`。
+    """
+    real: list[str] = []      # 需要**复制内容**的目录（相对 src_pdir，正斜杠）
+    missing: list[str] = []   # 在源里根本找不到的包
+    outside: list[str] = []   # 链接指到 profile 外面（宿主安装树等）：不该复制，也不该算失败
+    names: list[str] = []     # 闭包里涉及的所有包名
+    seen: set[str] = set()
+    queue: list[tuple[Path, str]] = [(src_pdir, p) for p in pkgs]
+    while queue:
+        from_dir, pkg = queue.pop(0)
+        if pkg in seen:
+            continue
+        seen.add(pkg)
+        entry = _resolve_nm(src_pdir, from_dir, pkg)
+        if entry is None:
+            if pkg not in missing:
+                missing.append(pkg)
+            continue
+        if pkg not in names:
+            names.append(pkg)
+        if _is_reparse(entry):
+            target = _read_link_target(entry)
+            root: Path | None = None
+            if target:
+                try:
+                    root = src_pdir / Path(strip_win_prefix(target)).relative_to(src_pdir)
+                except ValueError:
+                    root = None
+            if root is None:
+                if pkg not in outside:
+                    outside.append(pkg)
+                continue
+        else:
+            root = entry
+        try:
+            rel = str(root.relative_to(src_pdir)).replace("\\", "/")
+        except ValueError:
+            if pkg not in outside:
+                outside.append(pkg)
+            continue
+        if rel not in real:
+            real.append(rel)
+        for dep in _declared_deps(root):
+            queue.append((root, dep))
+    return real, missing, outside, names
+
+
+def _copy_plugin_files(src_pdir: Path, dst_pdir: Path, pkgs: list[str]) -> dict:
+    """离线直拷：复制依赖闭包 + 按目标路径重建链接 + 把顶层入口挂回 node_modules。
+
+    两个必须做对的地方（都是这个项目已经踩过的坑）：
+    · junction **不能照抄**：源里的链接目标是绝对路径，照抄会让目标 profile 继续指着源
+      （"看着装上了"，其实两边共享同一份代码）。这里用 `relink_junctions` 按目标路径重建。
+    · 顶层入口 `node_modules/<pkg>` 可能本身就是个链接（hoisted 链接器下很常见），
+      它的真实内容在 `.pnpm/...` 里——内容复制完之后要**再把链接建回来**，连依赖的入口一起。
+      只给"用户勾选的那几个包"建是不够的：实测里 alpha 依赖 beta，beta 的入口不建回来，
+      alpha 在目标里就解析不到 beta。
+    """
+    real, missing, outside, names = _plugin_closure(src_pdir, pkgs)
+    # 先记下"目标里本来就有的入口"：复制过程会把新入口建出来，事后再查会把刚建的当成"本来就有"
+    pre_existing = set()
+    for name in names:
+        dst_entry = dst_pdir / "node_modules" / name
+        try:
+            if dst_entry.exists() or _is_reparse(dst_entry):
+                pre_existing.add(name)
+        except OSError:
+            pass
+    res = {
+        "real": real, "missing": missing, "outside": outside,
+        "files": 0, "bytes": 0, "links": 0, "errors": [], "fresh": [], "kept": [],
+    }
+    for rel in real:
+        src, dst = src_pdir / rel, dst_pdir / rel
+        if dst.exists() or _is_reparse(dst):
+            # 目标里已经有这个东西：一律不覆盖。覆盖 .pnpm 里的条目会连累别的包，
+            # 而版本对不对由调用方核对后写进结果，不靠"悄悄盖掉"。
+            res["kept"].append(rel)
+            continue
+        stats = copy_tree(src, dst)
+        res["files"] += stats["files"]
+        res["bytes"] += stats["bytes"]
+        res["links"] += stats["links"]
+        res["errors"] += list(stats["errors"])
+        res["fresh"].append(rel)
+        # 目录内部的链接（.pnpm/<x>/node_modules/<dep>）按目标 profile 的路径重建
+        relink = relink_junctions(src, dst, [(src_pdir, dst_pdir)])
+        res["links"] += relink["made"]
+        res["errors"] += list(relink["errors"])
+
+    # 顶层入口：源里是链接的，按目标路径把链接建回来（内容已经在上面复制过了）
+    made_at_top: list[str] = []
+    for name in names:
+        src_entry = src_pdir / "node_modules" / name
+        dst_entry = dst_pdir / "node_modules" / name
+        try:
+            if not src_entry.exists():
+                continue
+        except OSError:
+            continue
+        if dst_entry.exists() or _is_reparse(dst_entry):
+            if name in pre_existing:
+                res["kept"].append(f"node_modules/{name}")
+            continue
+        if not _is_reparse(src_entry):
+            continue          # 普通目录：闭包里已经整体复制过
+        target = _read_link_target(src_entry)
+        if not target:
+            continue
+        try:
+            rel = str(Path(strip_win_prefix(target)).relative_to(src_pdir)).replace("\\", "/")
+        except ValueError:
+            continue          # 指向 profile 外面：不复制、也不重建
+        new_target = dst_pdir / rel
+        if not new_target.exists():
+            res["errors"].append((str(dst_entry), f"链接目标还没复制上：{rel}"))
+            continue
+        try:
+            make_junction(new_target, dst_entry)
+            res["links"] += 1
+            made_at_top.append(f"node_modules/{name}")
+        except Exception as exc:  # noqa: BLE001
+            res["errors"].append((str(dst_entry), f"{type(exc).__name__}: {exc}"))
+    res["top_links"] = made_at_top
+    return res
+
+
+def _merge_profile_manifest(pdir: Path, deps: dict, bundles: list[str],
+                            overwrite_deps: bool = False) -> dict:
+    """把依赖与组合包登记合并进目标 profile 的 package.json（其它字段一字不动）。"""
+    manifest = pdir / "package.json"
+    data: dict = {}
+    if manifest.is_file():
+        try:
+            loaded = json.loads(manifest.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+        except Exception:
+            data = {}
+    cur_deps = data.get("dependencies")
+    if not isinstance(cur_deps, dict):
+        cur_deps = {}
+    added_deps, changed_deps = [], []
+    for name, spec in deps.items():
+        if name in cur_deps and not overwrite_deps:
+            continue          # 清单里已经有这一条：不动它（pnpm 自己写的那份说了算）
+        before = cur_deps.get(name)
+        if before == spec:
+            continue
+        cur_deps[name] = spec
+        (changed_deps if before is not None else added_deps).append(name)
+    data["dependencies"] = cur_deps
+    dsh = data.get("dsh")
+    if not isinstance(dsh, dict):
+        dsh = {}
+    profile_block = dsh.get("profile")
+    if not isinstance(profile_block, dict):
+        profile_block = {}
+    cur_bundles = profile_block.get("bundles")
+    if not isinstance(cur_bundles, list):
+        cur_bundles = []
+    added_bundles = []
+    for bundle in bundles:
+        if bundle and bundle not in cur_bundles:
+            cur_bundles.append(bundle)
+            added_bundles.append(bundle)
+    profile_block["bundles"] = cur_bundles
+    dsh["profile"] = profile_block
+    data["dsh"] = dsh
+    pdir.mkdir(parents=True, exist_ok=True)
+    backup = _backup_file(manifest)
+    tmp = manifest.with_name(manifest.name + ".dsh-lanes.tmp")
+    try:
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, manifest)
+    except OSError as exc:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        return {"ok": False, "why": str(exc), "backup": backup,
+                "added_deps": [], "changed_deps": [], "added_bundles": []}
+    return {"ok": True, "why": "", "backup": backup,
+            "added_deps": added_deps, "changed_deps": changed_deps,
+            "added_bundles": added_bundles}
+
+
+ENTRY_ID_RE = re.compile(r"^- id:\s*['\"]?([A-Za-z0-9_.@/:-]+)['\"]?\s*$")
+
+
+def _patch_entry_blocks(text: str) -> list[tuple[str, list[str]]]:
+    """把补丁层按**顶层条目**切开：[(行 id 或 "", 条目原文行)]。
+
+    只认列 0 的 `- ...`：用户层就是一份顶层 YAML 数组，条目从列 0 开始，后续行缩进更深。
+    切错会写出重复键（2026-09-27 那次 profile 起不来就是这个原因），所以宁可切不进去、
+    也不要切错——切不进去的条目我们只是不搬，不会写坏任何东西。
+    """
+    blocks: list[tuple[str, list[str]]] = []
+    cur: list[str] | None = None
+    for raw in text.splitlines():
+        if raw.startswith("- ") or raw.rstrip() == "-":
+            if cur is not None:
+                blocks.append(cur)  # type: ignore[arg-type]
+            cur = [raw]
+            continue
+        if cur is not None:
+            cur.append(raw)
+    if cur is not None:
+        blocks.append(cur)
+    out: list[tuple[str, list[str]]] = []
+    for block in blocks:
+        match = ENTRY_ID_RE.match(block[0].rstrip())
+        out.append((match.group(1) if match else "", block))
+    return out
+
+
+def patch_blocks_for_ids(text: str, ids: set[str]) -> list[list[str]]:
+    """挑出源补丁层里针对这些行 id 的条目（原文照搬，不改一个字符）。"""
+    return [block for row_id, block in _patch_entry_blocks(text) if row_id and row_id in ids]
+
+
+def merge_patch_blocks(dst_text: str, blocks: list[list[str]]) -> tuple[bool, str, str, list[str]]:
+    """把条目追加到目标补丁层（目标里已有的行 id 不重复写）。"""
+    have = {row_id for row_id, _ in _patch_entry_blocks(dst_text) if row_id}
+    fresh: list[list[str]] = []
+    added: list[str] = []
+    for block in blocks:
+        match = ENTRY_ID_RE.match(block[0].rstrip())
+        row_id = match.group(1) if match else ""
+        if not row_id or row_id in have:
+            continue
+        have.add(row_id)
+        fresh.append(block)
+        added.append(row_id)
+    if not fresh:
+        return True, "", dst_text, []
+    ok_dialect, why, new_text = append_patch_entries(
+        dst_text, [line for block in fresh for line in block]
+    )
+    if not ok_dialect:
+        return False, why, dst_text, []
+    return True, "", new_text, added
+
+
+NON_REGISTRY_SPEC_RE = re.compile(r"^(file|link|github|git\+|git@|https?|ssh|workspace):", re.I)
+
+
+def _spec_for_install(src_pdir: Path, pkg: str, spec: str, version: str) -> str:
+    """算出该在目标里点名装什么。
+
+    规矩：**能点名到具体版本就一定点名**——`^1.2.0` 换个时间会解析成另一个版本，
+    那就不叫"迁移"了，叫"装个新的"。只有三类例外：
+
+    · `file:` / `link:` —— 本地路径，没有版本号这回事。相对路径是相对**源 profile** 的，
+      而目标 profile 的深度不一样（这个项目复制副本时踩过同一个坑），所以换成绝对路径。
+    · git / 远程地址 —— 实测里 `dsh-liquid-glass` 写的是 `github:xingyingyuzhui/...`，
+      它装的 0.12.82 在 npm registry 上**未必存在**（这正是用 git 装的原因）。
+      这种必须原样搬 spec，改写成版本号会 404。
+    · git 地址带 commit 也是同理：锁定的就是那个 commit。
+    """
+    raw = (spec or "").strip()
+    if raw.startswith(("file:", "link:")):
+        tail = raw.split(":", 1)[1]
+        path = Path(tail)
+        if not path.is_absolute():
+            path = src_pdir / path
+        try:
+            return f"file:{path.resolve()}"
+        except OSError:
+            return f"file:{path}"
+    if NON_REGISTRY_SPEC_RE.match(raw):
+        return raw
+    if version:
+        return version
+    return raw or "latest"
+
+
+def plugin_transfer_plan(cfg: dict, src_lane: str, src_profile: str,
+                         dst_lane: str, dst_profile: str, pkgs: list[str],
+                         mode: str = "install") -> dict:
+    """先算清楚"会发生什么"，再让人点确认。任何一条不对就整件事不做。"""
+    plan: dict = {"ok": False, "why": "", "mode": mode, "items": [], "warnings": []}
+    if mode not in PLUGIN_TRANSFER_MODES:
+        plan["why"] = f"不认识的迁移方式「{mode}」（只有 {'、'.join(PLUGIN_TRANSFER_MODES)}）"
+        return plan
+    lanes = cfg.get("lanes", {})
+    for label, lane in (("源", src_lane), ("目标", dst_lane)):
+        if lane not in lanes:
+            plan["why"] = f"{label} lane「{lane}」不存在"
+            return plan
+    if src_lane == dst_lane and src_profile == dst_profile:
+        plan["why"] = f"源和目标都是「{src_lane}/{src_profile}」，没有可搬的东西"
+        return plan
+
+    src_home, dst_home = lane_home(cfg, src_lane), lane_home(cfg, dst_lane)
+    src_pdir = profile_dir(src_home, src_profile)
+    dst_pdir = profile_dir(dst_home, dst_profile)
+    src_view = lane_profiles_view(cfg, src_lane)
+    if src_profile not in src_view or not src_view[src_profile]["onDisk"]:
+        plan["why"] = (f"源 profile「{src_lane}/{src_profile}」在磁盘上不存在"
+                       f"（现有：{'、'.join(sorted(src_view)) or '无'}）")
+        return plan
+    try:
+        validate_profile_name(dst_profile)
+    except ValueError as exc:
+        plan["why"] = str(exc)
+        return plan
+
+    listing = plugin_listing(cfg, src_lane, src_profile)
+    by_pkg = {item["pkg"]: item for item in listing["bundles"]}
+    wanted: list[str] = []
+    for pkg in pkgs:
+        name = (pkg or "").strip()
+        if name and name not in wanted:
+            wanted.append(name)
+    if not wanted:
+        plan["why"] = "没有勾选任何插件"
+        return plan
+
+    items = []
+    for name in wanted:
+        item = by_pkg.get(name)
+        if item is None:
+            plan["why"] = (f"源里没有插件「{name}」（它既不在 profile 的依赖里，"
+                           f"也不在 dsh.profile.bundles 里）")
+            return plan
+        version = installed_pkg_version(src_home, name, src_profile) or ""
+        spec = item["spec"] or ""
+        after = _spec_for_install(src_pdir, name, spec, version)
+        dst_have = installed_pkg_version(dst_home,
+                                         name, dst_profile) if dst_pdir.is_dir() else None
+        action = "install" if mode == "install" else "copy"
+        why = ""
+        if not item["installed"] and mode == "install":
+            action, why = "skip", "源里其实没装上（只有清单登记）"
+        elif dst_have == version and version:
+            why = f"目标里已经是 {version}"
+        items.append({
+            "pkg": name, "spec": spec, "version": version, "want": after,
+            "official": item["official"], "rows": list(item["rows"]),
+            "dst_have": dst_have or "", "action": action, "why": why,
+        })
+
+    plan.update({
+        "ok": True,
+        "src": {"lane": src_lane, "profile": src_profile, "home": src_home, "dir": src_pdir},
+        "dst": {"lane": dst_lane, "profile": dst_profile, "home": dst_home, "dir": dst_pdir,
+                "onDisk": dst_pdir.is_dir()},
+        "items": items,
+        "patch_file": plugin_patch_path(cfg, dst_lane, dst_profile),
+        "src_patch_text": listing["patch_text"],
+    })
+    if not plan["dst"]["onDisk"]:
+        plan["warnings"].append(
+            f"目标 profile「{dst_lane}/{dst_profile}」磁盘上还没有，会按官方 web 组合先建一个干净环境"
+        )
+    if lane_runtime(cfg, dst_lane, dst_profile):
+        plan["warnings"].append(
+            f"目标「{dst_lane}/{dst_profile}」正在运行：写的文件要重启那次启动才会生效"
+        )
+    if mode == "copy":
+        plan["warnings"].append(
+            "离线直拷不会同步 pnpm 账本（pnpm-lock.yaml）：包能用，但之后在目标里装别的东西时"
+            "pnpm 可能要重新解析一次"
+        )
+    return plan
+
+
+def transfer_plugins(cfg: dict, src_lane: str, src_profile: str,
+                     dst_lane: str, dst_profile: str, pkgs: list[str],
+                     mode: str = "install", timeout: int = 1800) -> dict:
+    """真正搬插件。返回逐条结果，成败都写清楚。"""
+    me = ME_NAME
+    plan = plugin_transfer_plan(cfg, src_lane, src_profile, dst_lane, dst_profile, pkgs, mode)
+    if not plan["ok"]:
+        fail(plan["why"])
+        return {"ok": False, "why": plan["why"], "items": [], "plan": plan}
+
+    items = [i for i in plan["items"] if i["action"] != "skip"]
+    if not items:
+        # 全都"目标里已经是这个版本"：不算失败，但也确实什么都没做
+        for item in plan["items"]:
+            ok(f"  {item['pkg']}：{item['why'] or '无需处理'}")
+        info(col("  没有需要搬的东西。", C.GRAY))
+        return {"ok": True, "why": "", "items": plan["items"], "plan": plan, "done": 0}
+
+    what = "重新安装（点名到版本）" if mode == "install" else "离线直拷（不走网络/node）"
+    info(col(f"── 迁移插件 ──", C.BOLD))
+    info(f"  源        {src_lane}/{src_profile}")
+    info(f"  目标      {dst_lane}/{dst_profile}")
+    info(f"  方式      {what}")
+    info(f"  插件      {len(items)} 个：{'、'.join(i['pkg'] for i in items)}")
+    for line in plan["warnings"]:
+        warn(f"  注意      {line}")
+
+    dst = plan["dst"]
+    dst_pdir: Path = dst["dir"]
+    if not dst["onDisk"]:
+        info(col("  目标 profile 磁盘上不存在：先按官方 web 组合建干净环境", C.GRAY))
+        init_profile_dir(dst_pdir, SHIPPED_TEMPLATES[DEFAULT_PROFILE])
+        set_profile_hint(cfg, dst_lane, dst_profile,
+                         createdAt=time.strftime("%Y-%m-%d %H:%M:%S"))
+
+    results = []
+    if mode == "install":
+        for item in items:
+            target_spec = f"{item['pkg']}@{item['want']}"
+            info(col(f"  · 装 {target_spec} → {dst_lane}/{dst_profile}（走 dsh plugin → pnpm）…", C.GRAY))
+            res = run_plugin_cmd(cfg, dst_lane, ["add", target_spec, "--save-exact"],
+                                 timeout=timeout, label="plugin-transfer",
+                                 profile=dst_profile)
+            got = installed_pkg_version(dst["home"], item["pkg"], dst_profile) or ""
+            entry = dict(item)
+            entry.update({
+                "ok": bool(res["ok"]) and bool(got),
+                "got": got,
+                "rc": res["rc"],
+                "error": res["error"],
+                "tail": list(res["tail"])[-6:],
+            })
+            if entry["ok"]:
+                ok(f"  √ {item['pkg']} {got or item['want']}"
+                   + ("（与源一致）" if got == item["version"] and item["version"] else ""))
+                if item["version"] and got != item["version"]:
+                    warn(f"    源里是 {item['version']}，目标装成 {got}（这个版本在目标的 dsh 版本上可能没同步）")
+            else:
+                fail(f"  × {item['pkg']} 没装上（退出码 {res['rc']}"
+                     f"{'：' + res['error'] if res.get('error') else ''}）")
+                for line in entry["tail"]:
+                    info(col("      " + line, C.GRAY))
+            results.append(entry)
+    else:
+        info(col("  · 正在复制依赖闭包…", C.GRAY))
+        copied = _copy_plugin_files(plan["src"]["dir"], dst_pdir, [i["pkg"] for i in items])
+        info(col(f"    复制 {copied['files']} 个文件 / {human_size(copied['bytes'])}，"
+                 f"重建链接 {copied['links']} 个，目标里已有跳过 {len(copied['kept'])} 项", C.GRAY))
+        for rel in copied["fresh"]:
+            info(col(f"      + {rel}", C.GRAY))
+        for rel in copied["kept"]:
+            info(col(f"      = {rel}（目标里本来就有，没覆盖）", C.GRAY))
+        for name in copied["outside"]:
+            warn(f"      ! {name} 的链接指向 profile 外面（宿主安装树之类），没有复制")
+        for name in copied["missing"]:
+            warn(f"      ! {name} 在源里没找到")
+        for path_text, reason in copied["errors"][:6]:
+            warn(f"      ! {path_text}：{reason}")
+        for item in items:
+            got = installed_pkg_version(dst["home"], item["pkg"], dst_profile) or ""
+            entry = dict(item)
+            entry.update({"ok": bool(got), "got": got, "rc": 0, "error": "", "tail": []})
+            if entry["ok"]:
+                ok(f"  √ {item['pkg']} {got}")
+            else:
+                fail(f"  × {item['pkg']} 复制后仍然不在目标里")
+            results.append(entry)
+
+    # ── 清单：依赖 + 组合包登记（不登记 bundles 宿主根本不会加载它）
+    deps = {i["pkg"]: (i["want"] if mode == "copy" else (i["spec"] or i["want"]))
+            for i in results if i["ok"]}
+    bundle_src = read_profile_bundles(plan["src"]["home"], src_profile)
+    bundles = [i["pkg"] for i in results if i["ok"] and i["pkg"] in bundle_src]
+    merge = _merge_profile_manifest(dst_pdir, deps, bundles,
+                                    overwrite_deps=(mode == "copy"))
+    if not merge["ok"]:
+        fail(f"  更新目标 profile 的 package.json 失败：{merge['why']}")
+    else:
+        if merge["backup"]:
+            info(col(f"  package.json 已留底：{merge['backup']}", C.GRAY))
+        if merge["added_deps"] or merge["changed_deps"]:
+            info(col(f"  依赖已写入：{'、'.join(merge['added_deps'] + merge['changed_deps'])}", C.GRAY))
+        if merge["added_bundles"]:
+            info(col(f"  组合包登记已写入 dsh.profile.bundles：{'、'.join(merge['added_bundles'])}", C.GRAY))
+        missing_bundles = [i["pkg"] for i in results if i["ok"]
+                           and i["pkg"] in bundle_src
+                           and i["pkg"] not in read_profile_bundles(dst["home"], dst_profile)]
+        if missing_bundles:
+            warn(f"  这几个包在源里是组合包、但没写进目标：{'、'.join(missing_bundles)}")
+
+    # ── 补丁层：把源里针对这些插件行 id 的覆盖条目搬过去（"关掉的插件"才不会被重新打开）
+    wanted_rows = {row for item in results if item["ok"] for row in item["rows"]}
+    blocks = patch_blocks_for_ids(plan["src_patch_text"], wanted_rows) if wanted_rows else []
+    if blocks:
+        patch_file: Path = plan["patch_file"]
+        text = patch_file.read_text(encoding="utf-8") if patch_file.is_file() else ""
+        backup = _backup_file(patch_file)
+        ok_merge, why, new_text, added = merge_patch_blocks(text, blocks)
+        if not ok_merge:
+            warn(f"  补丁层没搬（{why}）——源里对这些插件的开关状态需要你自己在目标里重设")
+        elif added:
+            wrote, why2 = write_patch_text(patch_file, new_text)
+            if wrote:
+                ok(f"  补丁层已搬过去 {len(added)} 条覆盖：{'、'.join(added)}")
+                if backup:
+                    info(col(f"      原补丁层已留底：{backup}", C.GRAY))
+            else:
+                warn(f"  补丁层写入失败：{why2}")
+        else:
+            info(col("  补丁层：目标里已经有同样的条目，没重复写", C.GRAY))
+
+    good = [i for i in results if i["ok"]]
+    bad = [i for i in results if not i["ok"]]
+    info("")
+    if bad:
+        warn(f"  结果：成功 {len(good)} 个，失败 {len(bad)} 个：{'、'.join(i['pkg'] for i in bad)}")
+    else:
+        ok(f"  结果：{len(good)} 个插件都已就位")
+    info(col(f"  核对： py {me} plugins {dst_lane} --profile {dst_profile}", C.CYAN))
+    if lane_runtime(cfg, dst_lane, dst_profile):
+        info(col(f"  目标正在运行 —— 重启它才会加载新插件： "
+                 f"py {me} stop {dst_lane}/{dst_profile} ； py {me} open {dst_lane}/{dst_profile}", C.CYAN))
+    return {"ok": not bad, "why": "", "items": results, "plan": plan, "done": len(good),
+            "failed": [i["pkg"] for i in bad], "merge": merge}
+
+
+def cmd_plugin_transfer(cfg: dict, args) -> int:
+    """把插件从一个 profile 搬到另一个 profile / 另一个版本。"""
+    lane = getattr(args, "lane", "") or ""
+    parts = lane.split("/", 1)
+    src_lane, src_profile = parts[0], (parts[1] if len(parts) > 1 else PROFILE_NAME)
+    target = (getattr(args, "to", "") or "")
+    if not src_lane or not target:
+        fail("用法：plugin-transfer <源lane[/profile]> <目标lane[/profile]> 插件名 [插件名…]")
+        return 1
+    parts = target.split("/", 1)
+    dst_lane, dst_profile = parts[0], (parts[1] if len(parts) > 1 else PROFILE_NAME)
+    pkgs = list(getattr(args, "names", []) or [])
+    if not pkgs:
+        fail("没写要搬哪些插件（也可以写 all＝源里全部第三方插件）")
+        return 1
+    if pkgs == ["all"]:
+        pkgs = [i["pkg"] for i in profile_plugins(cfg, src_lane, src_profile)]
+        if not pkgs:
+            fail(f"源「{src_lane}/{src_profile}」里没有第三方插件")
+            return 1
+    mode = getattr(args, "mode", None) or "install"
+    if getattr(args, "dry_run", False):
+        plan = plugin_transfer_plan(cfg, src_lane, src_profile, dst_lane, dst_profile, pkgs, mode)
+        if not plan["ok"]:
+            fail(plan["why"])
+            return 1
+        info(col(f"── 迁移计划（--dry-run，什么都没做）──", C.BOLD))
+        info(f"  源        {src_lane}/{src_profile}")
+        info(f"  目标      {dst_lane}/{dst_profile}"
+             + ("" if plan["dst"]["onDisk"] else "（磁盘上还没有，会先建）"))
+        info(f"  方式      {'重新安装（点名到版本）' if mode == 'install' else '离线直拷'}")
+        for item in plan["items"]:
+            info(f"  · {item['pkg']}"
+                 + (f"  {item['version']}" if item["version"] else "")
+                 + f"  → {item['want']}"
+                 + (f"　（{item['why']}）" if item["why"] else ""))
+        for line in plan["warnings"]:
+            warn(f"  注意      {line}")
+        return 0
+    res = transfer_plugins(cfg, src_lane, src_profile, dst_lane, dst_profile, pkgs, mode)
+    return 0 if res["ok"] else 1
+
+
 def cmd_plugins_write_disabled(cfg: dict, args) -> int:
     """写补丁层来开关插件 —— 这个功能**已停用**（2026-09-27）。
 
@@ -6033,8 +6781,8 @@ def repair_pnpm_file_specs(cfg: dict, lane: str, profile: str = PROFILE_NAME) ->
 
 
 def run_plugin_cmd(cfg: dict, lane: str, pnpm_args: list[str], timeout: int = 1200,
-                   label: str = "plugin") -> dict:
-    """跑 `dsh plugin --profile web <pnpm 参数>`，把 pnpm 的输出落到文件再回读。
+                   label: str = "plugin", profile: str = PROFILE_NAME) -> dict:
+    """跑 `dsh plugin --profile <profile> <pnpm 参数>`，把 pnpm 的输出落到文件再回读。
 
     三个实测细节：
     · 子进程 stdio 必须接**文件句柄**：某些沙箱下管道会被拒绝（EPERM），而 pnpm 的输出还很长。
@@ -6048,8 +6796,8 @@ def run_plugin_cmd(cfg: dict, lane: str, pnpm_args: list[str], timeout: int = 12
     #   ① .modules.yaml 里指回原件的 virtualStoreDir
     #   ② pnpm-lock.yaml 里深度相关的 `file:` 相对路径（本地插件）
     repairs = [
-        repair_pnpm_virtual_store(cfg, lane, PROFILE_NAME),
-        repair_pnpm_file_specs(cfg, lane, PROFILE_NAME),
+        repair_pnpm_virtual_store(cfg, lane, profile),
+        repair_pnpm_file_specs(cfg, lane, profile),
     ]
     node = find_node(cfg)
     if not node:
@@ -6057,27 +6805,28 @@ def run_plugin_cmd(cfg: dict, lane: str, pnpm_args: list[str], timeout: int = 12
                 "seconds": 0, "repairs": repairs}
     entry = lane_entry_script(cfg, lane)
     logs = ensure_layout(cfg)["logs"]
-    log_p = logs / f".{label}-{lane}.log"
-    err_p = logs / f".{label}-{lane}.err"
+    # 日志名带上 profile：同一 lane 的两个 profile 可能同时装插件，共用一份日志会互相截断
+    log_p = logs / f".{label}-{lane}__{profile}.log"
+    err_p = logs / f".{label}-{lane}__{profile}.err"
     env = dict(os.environ)
     env["DSH_HOME"] = str(home)
     node_dir = str(Path(node).parent)
     if node_dir not in env.get("PATH", ""):
         env["PATH"] = node_dir + os.pathsep + env.get("PATH", "")
     args = list(pnpm_args)
-    store = pnpm_store_dir(home, PROFILE_NAME)
+    store = pnpm_store_dir(home, profile)
     if store:
         args.append(f"--config.store-dir={store}")
         # pnpm 11/12 读 PNPM_CONFIG_*（带盘符的路径写成命令行参数也能被某些版本忽略），两个都给最稳
         env["PNPM_CONFIG_STORE_DIR"] = store
-    cmd = [str(node), str(entry), "plugin", "--profile", PROFILE_NAME, *args]
+    cmd = [str(node), str(entry), "plugin", "--profile", profile, *args]
     rc = -1
     error = ""
     started = time.time()
     try:
         with open(log_p, "w", encoding="utf-8") as fo, open(err_p, "w", encoding="utf-8") as fe:
             rc = subprocess.run(cmd, stdout=fo, stderr=fe, env=env, timeout=timeout,
-                                cwd=str(profile_dir(home, PROFILE_NAME))).returncode
+                                cwd=str(profile_dir(home, profile))).returncode
     except subprocess.TimeoutExpired:
         rc, error = -2, f"超过 {timeout} 秒还没结束（已终止）"
     except Exception as exc:  # noqa: BLE001
@@ -6651,6 +7400,1472 @@ def cmd_chat_rm(cfg: dict, args) -> int:
     return 0
 
 
+# ================= 配置备份（轻量）：插件清单 + 会话 + 设置，恢复时自动拉取插件 =================
+#
+# clone 是"整套复制"（安装树 + HOME 动辄近 1 GB），慢且绑死同一个 dsh 版本；
+# chat-backup 只备份会话。这里做第三种：
+#
+#   cfg-backup  —— 只备份"装了什么"（每个 profile 的 package.json / cordis.patch.yml /
+#                  pnpm-workspace.yaml，含插件精确版本、bundles 登记、开关状态）+
+#                  会话 + 设置文件（+ 可选凭据 / 插件数据目录）+ file: 依赖引用到的
+#                  本地插件本体；**不备份** dsh 安装树与 profiles/node_modules。
+#   cfg-restore —— 新建 lane 装好 dsh 后，按清单用 `dsh plugin add pkg@版本 --save-exact`
+#                  把插件逐个联网拉回来，再把补丁层、会话、设置、凭据放回原位。
+#
+# 备份包是**单个 zip**（便于拷走 / 分享），放在 <root>/backups/config/：
+#
+#   manifest.json
+#   profiles/<p>/package.json  profiles/<p>/cordis.patch.yml
+#   profiles/<p>/pnpm-workspace.yaml  profiles/<p>/compatibility.json
+#   sessions/**                  （可选，默认带；.zstd 已压缩，zip 里再存不压缩）
+#   attachments/**               （可选，默认带，会话引用的附件）
+#   home/<相对路径>               （HOME 顶层设置白名单小文件）
+#   creds/.credentials.yaml      （可选，默认**不**带：敏感）
+#   local/<key>/**               （package.json 里 file:/link: 依赖实际引用的本地插件）
+#   data/<目录名>/**              （可选，用户勾选的插件数据目录）
+
+CFG_FORMAT = "dsh-lanes-config-backup"
+CFG_FORMAT_VERSION = 1
+CFG_FILE_PREFIX = "dshcfg-"
+
+# HOME 顶层"设置文件"的处理：显式点名一批，其余按"小体积 json/yaml"白名单兜底，
+# 统计账本 / 用量 / 运行态 / .bak 一律排除。
+CFG_SETTINGS_EXPLICIT = (
+    "settings.yaml", "settings.yaml.imported",
+    "dsh-service-config.json", "dsh-service-session-titles.json",
+    "dsh-service-subagent-route.json", "dsh-web-settings-legacy-import.json",
+    "pet.json", "studymate-config.yaml", "skin-center-active.json",
+    "thinking-effort-loaded.json", "remote-web-ui-devices.json",
+    ".anonymous-user-id", "cordis.patch.yml",
+)
+CFG_SETTING_EXCLUDE_RE = re.compile(
+    r"(^\.credentials\.yaml$)"
+    r"|(^\.dsh-usage)"
+    r"|(^\.dshw-)"
+    r"|(^tokenledger)"
+    r"|(^dsh-service-usage-index)"
+    r"|(\.bak$)"
+    r"|(\.before-)"
+    r"|(\.notify-)"
+    r"|(\.reconcile)"
+)
+CFG_SETTING_RE = re.compile(r".*\.(json|ya?ml)$", re.I)
+CFG_MAX_SETTING_BYTES = 2 * 1024 * 1024
+
+# HOME 顶层目录里，"插件数据目录"可勾选名单的排除项：
+# 安装树 / 会话 / 缓存 / 日志 / 备份 / 账本 / 市场工作目录不进（要么体积没意义，要么是工作态）。
+CFG_DATA_EXCLUDE = {
+    "profiles", "sessions", "attachments", "cache", "logs", "backups",
+    "node_modules", "dsh-market", "dsh-config-manager", "storages",
+    "plugins", "local-plugins", "dsh-session-archive",
+}
+
+# 每个 profile 原样带走的清单文件（缺一两个没关系，按实际存在的打）
+CFG_PROFILE_FILES = ("package.json", "cordis.patch.yml", "pnpm-workspace.yaml",
+                     "compatibility.json")
+
+
+def cfg_backup_root(cfg: dict) -> Path:
+    return paths(cfg)["backups"] / "config"
+
+
+def cfg_setting_files(home: Path) -> list[Path]:
+    """HOME 顶层该进备份的设置文件（白名单，小文件，排除统计/账本/运行态）。"""
+    home = Path(home)
+    out: list[Path] = []
+    if not home.is_dir():
+        return out
+    seen: set[str] = set()
+    for entry in sorted(home.iterdir()):
+        if not entry.is_file():
+            continue
+        name = entry.name
+        if CFG_SETTING_EXCLUDE_RE.search(name):
+            continue
+        keep = name in CFG_SETTINGS_EXPLICIT or bool(CFG_SETTING_RE.match(name))
+        if not keep:
+            continue
+        try:
+            if entry.stat().st_size > CFG_MAX_SETTING_BYTES:
+                continue
+        except OSError:
+            continue
+        if name not in seen:
+            seen.add(name)
+            out.append(entry)
+    return out
+
+
+def cfg_data_dirs(home: Path) -> list[dict]:
+    """HOME 顶层可作为"插件数据"勾选的目录（排除工作态/缓存/账本后），带体积。"""
+    home = Path(home)
+    out: list[dict] = []
+    if not home.is_dir():
+        return out
+    for entry in sorted(home.iterdir()):
+        if not entry.is_dir() or entry.name in CFG_DATA_EXCLUDE:
+            continue
+        if _is_reparse(entry):
+            continue
+        size = dir_size(entry)
+        out.append({"name": entry.name, "dir": entry, "bytes": size})
+    return out
+
+
+def cfg_collect_local_specs(home: Path, profile_names: list[str]) -> list[dict]:
+    """找出各 profile package.json 里 file:/link: 依赖**实际引用**的本地文件/目录。
+
+    只收集真实存在于磁盘上的引用，按绝对路径去重；记录它在源 HOME 内还是外
+    （恢复时：HOME 内的还原到相对原位，HOME 外的收进目标 HOME/local-plugins/from-backup/）。
+    """
+    home = Path(home)
+    found: list[dict] = []
+    seen_paths: set[str] = set()
+    for prof in profile_names:
+        pdir = profile_dir(home, prof)
+        deps = profile_dependencies(home, prof)
+        for pkg, spec in deps.items():
+            raw = (spec or "").strip()
+            if not raw.lower().startswith(("file:", "link:")):
+                continue
+            tail = raw.split(":", 1)[1]
+            target = Path(tail)
+            if not target.is_absolute():
+                target = pdir / tail
+            try:
+                target = target.resolve()
+            except OSError:
+                pass
+            key = str(target).lower()
+            if not target.exists() or key in seen_paths:
+                continue
+            seen_paths.add(key)
+            try:
+                rel = target.relative_to(home.resolve()).as_posix()
+                inside = True
+            except (ValueError, OSError):
+                rel = ""
+                inside = False
+            safe = re.sub(r"[^A-Za-z0-9._-]+", "-", target.name).strip("-") or "item"
+            found.append({
+                "key": f"{len(found):02d}-{safe[:40]}",
+                "pkg": pkg,
+                "spec": raw,
+                "sourcePath": str(target),
+                "insideHome": inside,
+                "relPath": rel,
+                "isDir": target.is_dir(),
+            })
+    return found
+
+
+def cfg_profiles_of(home: Path, only: list[str] | None) -> list[str]:
+    """备份/恢复要处理的 profile 名单（磁盘真值；desktop 排除；默认全部）。"""
+    names = [p for p in disk_profiles(Path(home)) if p != "desktop"]
+    if only is not None:
+        wanted = set(only)
+        names = [p for p in names if p in wanted]
+    return names
+
+
+def cfg_backup_plan(cfg: dict, lane: str, sessions: bool = True, attachments: bool = True,
+                    settings: bool = True, credentials: bool = False,
+                    plugin_data: list[str] | None = None,
+                    profile_names: list[str] | None = None) -> dict:
+    """算清"这份备份会包含什么"（不写盘），供 CLI 与界面展示确认。"""
+    if lane not in cfg.get("lanes", {}):
+        return {"ok": False, "why": f"没有 lane「{lane}」"}
+    home = lane_home(cfg, lane)
+    if profile_names is not None:
+        missing = [p for p in profile_names if p not in disk_profiles(home)]
+        if missing:
+            return {"ok": False, "why": f"这几个 profile 不存在：{'、'.join(missing)}"}
+    profs = cfg_profiles_of(home, profile_names)
+    profiles_out = []
+    plugin_count = 0
+    for prof in profs:
+        plugins = profile_plugins(cfg, lane, prof, include_official=True)
+        plugin_count += sum(1 for p in plugins if not p["official"])
+        missing_files = [f for f in CFG_PROFILE_FILES
+                         if not (profile_dir(home, prof) / f).is_file()]
+        profiles_out.append({
+            "name": prof,
+            "plugins": plugins,
+            "thirdParty": sum(1 for p in plugins if not p["official"]),
+            "missingFiles": missing_files,
+        })
+    sess = {"files": 0, "bytes": 0}
+    if sessions and (home / "sessions").is_dir():
+        sess_bytes = dir_size(home / "sessions")
+        sess_files = sum(1 for _ in (home / "sessions").rglob("*") if _.is_file())
+        sess = {"files": sess_files, "bytes": sess_bytes}
+    att = {"files": 0, "bytes": 0}
+    if attachments and (home / "attachments").is_dir():
+        att = {"files": sum(1 for _ in (home / "attachments").rglob("*") if _.is_file()),
+               "bytes": dir_size(home / "attachments")}
+    setting_files = cfg_setting_files(home) if settings else []
+    cred_entries = sorted(read_credential_refs(home)) if credentials else []
+    if credentials and not (home / CRED_FILENAME).is_file():
+        cred_entries = []
+    local_files = cfg_collect_local_specs(home, profs)
+    for item in local_files:
+        src = Path(item["sourcePath"])
+        item["bytes"] = dir_size(src) if item["isDir"] else (src.stat().st_size if src.is_file() else 0)
+    data_avail = {d["name"]: d for d in cfg_data_dirs(home)}
+    data_picked = []
+    for name in (plugin_data or []):
+        d = data_avail.get(name)
+        if d:
+            data_picked.append({"name": name, "bytes": d["bytes"]})
+    total = (sess["bytes"] + att["bytes"] + sum(d["bytes"] for d in data_picked)
+             + sum(d["bytes"] for d in local_files)
+             + sum(f.stat().st_size for f in setting_files))
+    return {
+        "ok": True, "lane": lane, "home": home,
+        "dshVersion": cfg["lanes"][lane].get("version") or "",
+        "profiles": profiles_out, "profilesNames": profs,
+        "sessions": sess, "attachments": att,
+        "settingsFiles": [{"name": f.name, "bytes": f.stat().st_size} for f in setting_files],
+        "credentials": cred_entries,
+        "localFiles": local_files,
+        "dataDirs": [{"name": d["name"], "bytes": d["bytes"]} for d in data_avail.values()],
+        "dataPicked": data_picked,
+        "thirdParty": plugin_count,
+        "totalBytes": total,
+        "running": bool(lane_runtime(cfg, lane)),
+    }
+
+
+def _zip_add_tree(zf: zipfile.ZipFile, src: Path, prefix: str, stored: bool,
+                  hashes: dict[str, str]) -> dict:
+    """把一棵目录写进 zip（junction / reparse 点跳过）。stored=True 用不压缩（已压缩内容）。"""
+    src = Path(src)
+    stats = {"files": 0, "bytes": 0, "errors": []}
+    if not src.is_dir():
+        return stats
+    compress = zipfile.ZIP_STORED if stored else zipfile.ZIP_DEFLATED
+    for dirpath, _dirs, filenames in os.walk(src):
+        for name in filenames:
+            path = Path(dirpath) / name
+            if _is_reparse(path):
+                continue
+            rel = path.relative_to(src).as_posix()
+            arc = f"{prefix.rstrip('/')}/{rel}"
+            try:
+                data = path.read_bytes()
+            except OSError as exc:
+                stats["errors"].append(f"{rel}: {exc}")
+                continue
+            zinfo = zipfile.ZipInfo.from_file(path, arcname=arc)
+            zinfo.compress_type = compress
+            zf.writestr(zinfo, data)
+            hashes[arc] = hashlib.sha256(data).hexdigest()
+            stats["files"] += 1
+            stats["bytes"] += len(data)
+    return stats
+
+
+def _zip_add_bytes(zf: zipfile.ZipFile, arc: str, data: bytes,
+                   hashes: dict[str, str], compress: int = zipfile.ZIP_DEFLATED) -> None:
+    zinfo = zipfile.ZipInfo(arc)
+    zinfo.compress_type = compress
+    zinfo.external_attr = 0o600 << 16
+    zf.writestr(zinfo, data)
+    hashes[arc] = hashlib.sha256(data).hexdigest()
+
+
+def cfg_create_backup(cfg: dict, lane: str, label: str = "",
+                      sessions: bool = True, attachments: bool = True,
+                      settings: bool = True, credentials: bool = False,
+                      plugin_data: list[str] | None = None,
+                      profile_names: list[str] | None = None) -> dict:
+    """真正打一个配置备份 zip。返回 manifest（含 zip 路径）。"""
+    plan = cfg_backup_plan(cfg, lane, sessions=sessions, attachments=attachments,
+                           settings=settings, credentials=credentials,
+                           plugin_data=plugin_data, profile_names=profile_names)
+    if not plan["ok"]:
+        raise RuntimeError(plan["why"])
+    home = plan["home"]
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    safe_lane = re.sub(r"[^A-Za-z0-9._-]+", "-", lane).strip("-") or "lane"
+    name = f"{CFG_FILE_PREFIX}{safe_lane}-{stamp}"
+    if label:
+        name += "-" + re.sub(r"[^A-Za-z0-9._-]+", "-", label).strip("-")
+    name += ".zip"
+    root = cfg_backup_root(cfg)
+    root.mkdir(parents=True, exist_ok=True)
+    dest = root / name
+    if dest.exists():
+        dest = root / f"{dest.stem}-{int(time.time()) % 1000}.zip"
+
+    hashes: dict[str, str] = {}
+    manifest_profiles = []
+    try:
+        _cfg_write_backup_zip(dest, home, plan, hashes, manifest_profiles, lane, cfg)
+    except Exception:
+        # 半成品（缺 manifest / 写到一半）必须删掉，否则 cfg-list 里会挂着"损坏"包
+        if dest.exists():
+            try:
+                dest.unlink()
+            except OSError:
+                pass
+        raise
+    # 重新读一遍刚写完的 manifest（写 zip 的辅助函数会把它落到 dest）
+    manifest = cfg_read_manifest(dest)
+    manifest["zip"] = dest
+    manifest["name"] = dest.name
+    return manifest
+
+
+def _cfg_write_backup_zip(dest: Path, home: Path, plan: dict, hashes: dict[str, str],
+                          manifest_profiles: list[dict], lane: str, cfg: dict) -> None:
+    """把 plan 里选好的内容写成 zip（manifest 最后写，写失败则由调用方删掉半成品）。"""
+    with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        # ── profile 清单文件（不含 node_modules：插件本体恢复时联网拉回）
+        for prof in plan["profiles"]:
+            pname = prof["name"]
+            pdir = profile_dir(home, pname)
+            files_map = {}
+            for fname in CFG_PROFILE_FILES:
+                src = pdir / fname
+                if not src.is_file():
+                    continue
+                arc = f"profiles/{pname}/{fname}"
+                if fname == "pnpm-workspace.yaml":
+                    # 备份前先把 allowBuilds 里的非法 git/URL 键规范化（坏键会让恢复时
+                    # 所有 pnpm add 都失败）
+                    data = _cfg_normalize_workspace_text(
+                        src.read_text(encoding="utf-8")).encode("utf-8")
+                else:
+                    data = src.read_bytes()
+                _zip_add_bytes(zf, arc, data, hashes)
+                files_map[fname] = arc
+            manifest_profiles.append({
+                "name": pname,
+                "bundles": [p["pkg"] for p in prof["plugins"] if p["in_bundles"]],
+                "files": files_map,
+                "plugins": [{
+                    "pkg": p["pkg"],
+                    "spec": p["spec"],
+                    "version": p["version"],
+                    "inBundles": p["in_bundles"],
+                    "official": p["official"],
+                    "kind": p["kind"],
+                    "rows": p["rows"],
+                    "disabledRows": p["disabled_rows"],
+                    "localSpec": (p["spec"] if str(p["spec"]).lower().startswith(
+                        ("file:", "link:")) else ""),
+                } for p in prof["plugins"]],
+            })
+
+        contents: dict = {}
+
+        # ── 会话（.zstd 已压缩，zip 里不重复压）
+        if plan["sessions"].get("files"):
+            st = _zip_add_tree(zf, home / "sessions", "sessions", True, hashes)
+            if st["errors"]:
+                raise RuntimeError(f"打包会话时有错误：{st['errors'][:3]}")
+            contents["sessions"] = {"included": True, "files": st["files"],
+                                    "bytes": st["bytes"], "zipPrefix": "sessions"}
+        else:
+            contents["sessions"] = {"included": False, "files": 0, "bytes": 0}
+
+        # ── 会话附件
+        if plan["attachments"].get("files"):
+            st = _zip_add_tree(zf, home / "attachments", "attachments", True, hashes)
+            contents["attachments"] = {"included": True, "files": st["files"],
+                                       "bytes": st["bytes"], "zipPrefix": "attachments"}
+        else:
+            contents["attachments"] = {"included": False, "files": 0, "bytes": 0}
+
+        # ── 设置文件（白名单小文件，可压缩）
+        setting_items = []
+        for f in plan["settingsFiles"]:
+            fpath = home / f["name"]
+            arc = f"home/{f['name']}"
+            _zip_add_bytes(zf, arc, fpath.read_bytes(), hashes)
+            setting_items.append({"name": f["name"], "zipPath": arc, "bytes": f["bytes"]})
+        contents["settings"] = {"included": bool(setting_items), "files": setting_items}
+
+        # ── 凭据（默认不带；敏感）
+        if plan["credentials"]:
+            arc = "creds/.credentials.yaml"
+            _zip_add_bytes(zf, arc, (home / CRED_FILENAME).read_bytes(), hashes)
+            contents["credentials"] = {"included": True,
+                                        "entries": plan["credentials"],
+                                        "zipPath": arc}
+        else:
+            contents["credentials"] = {"included": False, "entries": []}
+
+        # ── file:/link: 本地依赖引用到的插件本体
+        local_items = []
+        for item in plan["localFiles"]:
+            src = Path(item["sourcePath"])
+            arc_base = f"local/{item['key']}"
+            if item["isDir"]:
+                st = _zip_add_tree(zf, src, arc_base, False, hashes)
+                item.update({"files": st["files"], "errors": st["errors"]})
+                zip_path = arc_base
+            else:
+                arc = f"{arc_base}/{src.name}"
+                _zip_add_bytes(zf, arc, src.read_bytes(), hashes)
+                item.update({"files": 1})
+                zip_path = arc
+            local_items.append({k: item[k] for k in
+                                ("key", "pkg", "spec", "sourcePath", "insideHome", "relPath",
+                                 "isDir", "bytes", "files")} | {"zipPath": zip_path})
+        contents["localFiles"] = local_items
+
+        # ── 勾选的插件数据目录
+        data_items = []
+        for d in plan["dataPicked"]:
+            src = home / d["name"]
+            st = _zip_add_tree(zf, src, f"data/{d['name']}", False, hashes)
+            data_items.append({"name": d["name"], "files": st["files"], "bytes": d["bytes"],
+                               "zipPrefix": f"data/{d['name']}", "errors": st["errors"]})
+        contents["pluginData"] = data_items
+
+        manifest = {
+            "format": CFG_FORMAT,
+            "formatVersion": CFG_FORMAT_VERSION,
+            "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "createdStamp": time.strftime("%Y%m%d-%H%M%S"),
+            "source": {"lane": lane, "home": str(home),
+                       "dshVersion": cfg["lanes"][lane].get("version") or ""},
+            "profiles": manifest_profiles,
+            "contents": contents,
+            "hashes": hashes,
+        }
+        # manifest 本身不进 hashes（它是最后才定稿的）
+        zf.writestr("manifest.json",
+                    json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"))
+
+
+def cfg_resolve_backup(cfg: dict, name_or_path: str) -> Path:
+    """备份名（可不带 .zip）或任意 zip 路径 → 实际 zip 路径。"""
+    raw = str(name_or_path or "").strip().strip('"')
+    if not raw:
+        raise ValueError("没给备份名或路径")
+    p = Path(raw)
+    if p.is_file():
+        return p
+    root = cfg_backup_root(cfg)
+    cand = root / raw
+    if cand.is_file():
+        return cand
+    if not raw.lower().endswith(".zip"):
+        cand = root / (raw + ".zip")
+        if cand.is_file():
+            return cand
+    matches = sorted(root.glob(f"{raw}*.zip")) if root.is_dir() else []
+    if len(matches) == 1:
+        return matches[0]
+    raise FileNotFoundError(f"找不到配置备份：{name_or_path}（目录 {root}）")
+
+
+def cfg_read_manifest(zip_path: Path) -> dict:
+    """读并校验备份包 manifest。"""
+    with zipfile.ZipFile(zip_path) as zf:
+        try:
+            data = json.loads(zf.read("manifest.json").decode("utf-8"))
+        except KeyError:
+            raise ValueError(f"{zip_path.name} 里没有 manifest.json，不是合法的配置备份包")
+    if data.get("format") != CFG_FORMAT:
+        raise ValueError(f"{zip_path.name} 不是 dsh-lanes 配置备份包（format={data.get('format')!r}）")
+    return data
+
+
+def cfg_list_backups(cfg: dict) -> list[dict]:
+    """列出全部配置备份包（按时间倒序）。"""
+    root = cfg_backup_root(cfg)
+    items: list[dict] = []
+    if not root.is_dir():
+        return items
+    for path in sorted(root.glob(f"{CFG_FILE_PREFIX}*.zip"), reverse=True):
+        item = {"name": path.name, "path": path, "bytes": 0, "ok": False,
+                "created": "", "sourceLane": "", "dshVersion": "", "profiles": [],
+                "thirdParty": 0, "sessions": 0, "credentials": False, "error": ""}
+        try:
+            item["bytes"] = path.stat().st_size
+            data = cfg_read_manifest(path)
+            item["ok"] = True
+            item["created"] = data.get("created") or ""
+            item["sourceLane"] = (data.get("source") or {}).get("lane") or ""
+            item["dshVersion"] = (data.get("source") or {}).get("dshVersion") or ""
+            item["profiles"] = [p["name"] for p in data.get("profiles") or []]
+            item["thirdParty"] = sum(
+                1 for p in data.get("profiles") or []
+                for plug in p.get("plugins") or [] if not plug.get("official"))
+            item["sessions"] = ((data.get("contents") or {}).get("sessions") or {}).get("files") or 0
+            item["credentials"] = bool(((data.get("contents") or {}).get("credentials") or {}).get(
+                "included"))
+        except Exception as exc:  # noqa: BLE001
+            item["error"] = f"{type(exc).__name__}: {exc}"
+        items.append(item)
+    return items
+
+
+def cfg_summary(manifest: dict) -> dict:
+    """从 manifest 算一份给人看的摘要（CLI show / 界面查看共用）。"""
+    contents = manifest.get("contents") or {}
+    profiles = []
+    for p in manifest.get("profiles") or []:
+        plugins = p.get("plugins") or []
+        profiles.append({
+            "name": p.get("name") or "",
+            "thirdParty": [x for x in plugins if not x.get("official")],
+            "officialCount": sum(1 for x in plugins if x.get("official")),
+            "bundles": p.get("bundles") or [],
+        })
+    return {
+        "created": manifest.get("created") or "",
+        "source": manifest.get("source") or {},
+        "profiles": profiles,
+        "sessions": contents.get("sessions") or {"included": False, "files": 0, "bytes": 0},
+        "attachments": contents.get("attachments") or {"included": False, "files": 0, "bytes": 0},
+        "settings": contents.get("settings") or {"included": False, "files": []},
+        "credentials": contents.get("credentials") or {"included": False, "entries": []},
+        "localFiles": contents.get("localFiles") or [],
+        "pluginData": contents.get("pluginData") or [],
+    }
+
+
+def _zip_validate(zf: zipfile.ZipFile, arc: str, hashes: dict[str, str]) -> str:
+    """按 manifest 里的指纹校验 zip 成员，返回错误串（空＝通过）。"""
+    if arc not in hashes:
+        return ""
+    actual = hashlib.sha256(zf.read(arc)).hexdigest()
+    return "" if actual == hashes[arc] else f"{arc} 指纹不符（备份包可能损坏）"
+
+
+def _safe_dest(root: Path, *parts: str) -> Path:
+    """拼 zip 解压目标路径，并挡住 zip-slip（越界路径直接报错）。"""
+    root = Path(root).resolve()
+    dest = root.joinpath(*parts).resolve()
+    if root not in dest.parents and dest != root:
+        raise ValueError(f"备份包里的路径越界：{parts}")
+    return dest
+
+
+def _zip_extract_tree(zf: zipfile.ZipFile, prefix: str, dest_root: Path,
+                      hashes: dict[str, str] | None = None,
+                      overwrite: bool = True, errors: list[str] | None = None) -> dict:
+    """把 zip 里 prefix/ 整棵解压到 dest_root（dest_root/<prefix 之后的相对路径>）。"""
+    stats = {"files": 0, "bytes": 0, "skipped": 0}
+    prefix = prefix.strip("/") + "/"
+    dest_root = Path(dest_root)
+    dest_root.mkdir(parents=True, exist_ok=True)
+    for info in zf.infolist():
+        if info.is_dir() or not info.filename.startswith(prefix):
+            continue
+        rel = info.filename[len(prefix):]
+        if not rel or rel.startswith("/"):
+            continue
+        if hashes:
+            err = _zip_validate(zf, info.filename, hashes)
+            if err:
+                if errors is not None:
+                    errors.append(err)
+                continue
+        dest = _safe_dest(dest_root, *rel.split("/"))
+        if dest.exists() and not overwrite:
+            stats["skipped"] += 1
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        data = zf.read(info.filename)
+        dest.write_bytes(data)
+        stats["files"] += 1
+        stats["bytes"] += len(data)
+    return stats
+
+
+def _zip_extract_file(zf: zipfile.ZipFile, arc: str, dest: Path,
+                      hashes: dict[str, str] | None = None) -> bytes:
+    """解压单个成员到 dest，返回字节。"""
+    if hashes:
+        err = _zip_validate(zf, arc, hashes)
+        if err:
+            raise ValueError(err)
+    data = zf.read(arc)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(data)
+    return data
+
+
+def cfg_restore_plan(cfg: dict, manifest: dict, target: str = "", new_lane: str = "",
+                     version: str = "", profiles: list[str] | None = None,
+                     sessions: bool = True, settings: bool = True,
+                     credentials: bool = True, plugin_data: bool = True) -> dict:
+    """把"恢复到谁、会装哪些插件、放回哪些东西"算清楚（不写盘）。"""
+    problems: list[str] = []
+    mode = "new" if new_lane else "existing"
+    dst = new_lane or target
+    if not dst:
+        problems.append("给一个已存在的目标 lane，或用 --new-lane 新建")
+    version = (version or "").strip()
+    if mode == "new":
+        if not new_lane:
+            problems.append("新 lane 名不能为空")
+        elif not LANE_NAME_RE.match(new_lane):
+            problems.append("lane 名只能用字母/数字/._-，且以字母或数字开头（最长 32）")
+        elif new_lane in cfg.get("lanes", {}):
+            problems.append(f"lane「{new_lane}」已经存在，要往它里面恢复就选目标 lane")
+        if not version:
+            version = (manifest.get("source") or {}).get("dshVersion") or ""
+            if not version:
+                problems.append("备份里没有 dsh 版本信息，请用 --version 指定要装的版本")
+        if cfg.get("external") and not cfg.get("cmd"):
+            problems.append("lanes.json 是 external 模式且没给 cmd，无法安装新版本")
+    else:
+        if not target:
+            problems.append("没给目标 lane")
+        elif target not in cfg.get("lanes", {}):
+            problems.append(f"没有 lane「{target}」（要新建请用 --new-lane）")
+
+    profs = manifest.get("profiles") or []
+    if profiles is not None:
+        wanted = set(profiles)
+        profs = [p for p in profs if p.get("name") in wanted]
+        missing = wanted - {p.get("name") for p in profs}
+        if missing:
+            problems.append(f"备份里没有这几个 profile：{'、'.join(sorted(missing))}")
+    third = [{"profile": p.get("name"), "pkg": x.get("pkg"), "want": x.get("version")
+              or x.get("spec"), "kind": x.get("kind"),
+              "local": bool(x.get("localSpec"))}
+             for p in profs for x in (p.get("plugins") or []) if not x.get("official")]
+    contents = manifest.get("contents") or {}
+    return {
+        "ok": not problems, "problems": problems, "mode": mode, "target": dst,
+        "version": version, "source": manifest.get("source") or {},
+        "profiles": [p.get("name") for p in profs],
+        "profileData": profs,
+        "thirdParty": third,
+        "sessions": contents.get("sessions") or {},
+        "settings": (contents.get("settings") or {}).get("files") or [],
+        "credentials": contents.get("credentials") or {"included": False},
+        "localFiles": contents.get("localFiles") or [],
+        "pluginData": contents.get("pluginData") or [],
+        "useSessions": sessions, "useSettings": settings,
+        "useCredentials": credentials, "usePluginData": plugin_data,
+        "running": (lane_any_running(cfg, target)
+                    if mode == "existing" and target in cfg.get("lanes", {}) else None),
+    }
+
+
+def _cfg_normalize_allow_build_key(key: str) -> str:
+    """allowBuilds 的键只接受「包名」或「包名@精确版本」。
+
+    pnpm 10.26+ 的 allowBuilds 把 `pkg@<version>` 里的 version 当 semver union 解析，
+    写 `pkg@git+https://...` / `pkg@https://....git` 会直接 ERR_PNPM_INVALID_VERSION_UNION，
+    而且这一个坏键会让**之后所有** `pnpm add` 都失败。git-hosted 依赖只能用裸包名放行，
+    所以这里把这类非 semver 后缀剥掉，降级成裸包名。
+    """
+    key = key.strip().strip('"').strip("'").strip()
+    if key.startswith("@"):
+        m = re.match(r"^(@[^/@]+/[^@\s]+)(?:@(.+))?$", key)
+    else:
+        m = re.match(r"^([^@\s]+)(?:@(.+))?$", key)
+    if not m:
+        return key
+    name, ver = m.group(1), (m.group(2) or "").strip()
+    if ver and ("://" in ver or ver.endswith(".git") or ver.endswith(".tgz")
+                or ver.startswith(("git", "github:", "gitlab:", "bitbucket:",
+                                   "file:", "link:"))):
+        return name
+    return key
+
+
+_WS_QUOTED_RE = re.compile(r"^(\s+)[\"']([^\"']*)[\"'](\s*:.*)$")
+_WS_BARE_RE = re.compile(r"^(\s+)([^\"':#\s]+)(\s*:.*)$")
+
+
+def _cfg_workspace_entry(line: str) -> tuple[str, str, str] | None:
+    """解析 allowBuilds 下一行条目 → (缩进, 原始键, 含冒号的剩余部分)；非条目返回 None。"""
+    m = _WS_QUOTED_RE.match(line)
+    if m:
+        return m.group(1), m.group(2), m.group(3)
+    m = _WS_BARE_RE.match(line)
+    if m:
+        return m.group(1), m.group(2), m.group(3)
+    return None
+
+
+def _cfg_normalize_workspace_text(text: str) -> str:
+    """把整份 pnpm-workspace.yaml 里 allowBuilds 的非法 git/URL 键就地规范化（返回新文本）。"""
+    in_block = False
+    out: list[str] = []
+    for line in text.splitlines():
+        if re.match(r"^allowBuilds\s*:", line):
+            in_block = True
+            out.append(line)
+            continue
+        if in_block:
+            if line.strip() and not line[0].isspace() and re.match(r"^[A-Za-z]", line):
+                in_block = False
+            else:
+                parsed = _cfg_workspace_entry(line)
+                if parsed:
+                    indent, raw, rest = parsed
+                    norm = _cfg_normalize_allow_build_key(raw)
+                    if norm != raw.strip().strip("'\""):
+                        out.append(f"{indent}{norm}{rest}")
+                        continue
+        out.append(line)
+    return "\n".join(out) + ("\n" if text.endswith("\n") else "")
+
+
+def _cfg_merge_workspace_allow_builds(dst_text: str, src_text: str) -> str:
+    """把备份 pnpm-workspace.yaml 里的 allowBuilds 条目合并进目标文本（同键不重复）。
+
+    git-hosted 插件（如 dsh-providers-hub）要在 allowBuilds 里点名才允许跑 prepare 构建，
+    否则 pnpm 直接 ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED。这条必须在**装插件之前**就位，
+    而模板新建的 workspace 文件里没有它。键会先经 _cfg_normalize_allow_build_key 规范化。
+    """
+    if "allowBuilds" not in src_text:
+        return dst_text
+    block: list[str] = []
+    in_block = False
+    for line in src_text.splitlines():
+        if re.match(r"^allowBuilds\s*:", line):
+            in_block = True
+            continue
+        if in_block:
+            # 顶层新键（列 0 起字母）出现＝块结束
+            if line.strip() and not line[0].isspace() and re.match(r"^[A-Za-z]", line):
+                break
+            block.append(line)
+    # 规范化后的 (键, 值) —— 去重，保留第一个
+    norm: dict[str, str] = {}
+    for line in block:
+        parsed = _cfg_workspace_entry(line)
+        if not parsed:
+            continue
+        _indent, raw_key, rest = parsed
+        key = _cfg_normalize_allow_build_key(raw_key)
+        val = rest.split(":", 1)[1].strip() if ":" in rest else "true"
+        if key not in norm:
+            norm[key] = val or "true"
+    if not norm:
+        return dst_text
+
+    # 目标里已有的键（同样规范化后比较）
+    have: set[str] = set()
+    for line in dst_text.splitlines():
+        parsed = _cfg_workspace_entry(line)
+        if parsed:
+            have.add(_cfg_normalize_allow_build_key(parsed[1]))
+    missing = [(k, v) for k, v in norm.items() if k not in have]
+    if not missing:
+        return dst_text
+    added = [f"  {k}: {v}" for k, v in missing]
+
+    if "allowBuilds" not in dst_text:
+        return dst_text.rstrip("\n") + "\nallowBuilds:\n" + "\n".join(added) + "\n"
+    out: list[str] = []
+    inserted = False
+    for line in dst_text.splitlines():
+        out.append(line)
+        if re.match(r"^allowBuilds\s*:", line) and not inserted:
+            out.extend(added)
+            inserted = True
+    return "\n".join(out) + ("\n" if dst_text.endswith("\n") else "")
+
+
+def cfg_restore(cfg: dict, zip_path: Path, target: str = "", new_lane: str = "",
+                version: str = "", profiles: list[str] | None = None,
+                use_sessions: bool = True, use_settings: bool = True,
+                use_credentials: bool = True, use_plugin_data: bool = True,
+                stop: bool = True, timeout: int = 1200) -> dict:
+    """把配置备份恢复进目标 lane（不存在则按 --new-lane 先装一个 dsh）。"""
+    zip_path = Path(zip_path)
+    manifest = cfg_read_manifest(zip_path)
+    plan = cfg_restore_plan(cfg, manifest, target=target, new_lane=new_lane,
+                            version=version, profiles=profiles,
+                            sessions=use_sessions, settings=use_settings,
+                            credentials=use_credentials, plugin_data=use_plugin_data)
+    if not plan["ok"]:
+        raise RuntimeError("；".join(plan["problems"]))
+    lane = plan["target"]
+
+    # ── 1) 新建 lane：先装 dsh（复用 create 的完整安装流程）
+    if plan["mode"] == "new":
+        ok(f"① 新建 lane「{lane}」并安装 dsh {plan['version']} …")
+        args = argparse.Namespace(lane=lane, version=plan["version"], registry=None,
+                                  force=False, follow=False)
+        rc = cmd_create(cfg, args)
+        if rc != 0:
+            raise RuntimeError(f"dsh 安装失败（退出码 {rc}），恢复中止")
+        cfg = load_config()
+
+    # ── 2) 运行中的 lane 先停（插件安装 / 会话覆盖都要求静态）
+    rt = lane_any_running(cfg, lane)
+    if rt:
+        if not stop:
+            raise RuntimeError(f"lane「{lane}」正在运行（PID {rt.get('pid')}）：先停掉它，或允许自动停")
+        warn(f"  lane「{lane}」正在运行（PID {rt.get('pid')}），先停掉 …")
+        for prof in lane_profiles_view(cfg, lane):
+            _stop_pair(cfg, lane, prof)
+
+    home = lane_home(cfg, lane)
+    home.mkdir(parents=True, exist_ok=True)
+    hashes = manifest.get("hashes") or {}
+    contents = manifest.get("contents") or {}
+    profs = plan["profileData"]
+    report = {"installed": [], "failed": [], "skipped": [], "lane": lane,
+              "new": plan["mode"] == "new", "restored": []}
+
+    with zipfile.ZipFile(zip_path) as zf:
+        # ── 3) 先还原 file:/link: 本地插件本体，得到 pkg → 新 spec 映射
+        spec_map: dict[str, str] = {}
+        restored_local: list[dict] = []
+        for item in contents.get("localFiles") or []:
+            pkg = item.get("pkg")
+            prefix = item.get("zipPath")
+            if item.get("insideHome") and item.get("relPath"):
+                dst_path = home / item["relPath"]
+            else:
+                key = item.get("key") or "item"
+                if item.get("isDir"):
+                    dst_path = home / "local-plugins" / "from-backup" / key
+                else:
+                    dst_path = home / "local-plugins" / "from-backup" / key / Path(
+                        item.get("sourcePath")).name
+            if item.get("isDir"):
+                st = _zip_extract_tree(zf, prefix, dst_path, hashes)
+            else:
+                _zip_extract_file(zf, prefix, dst_path, hashes)
+                st = {"files": 1, "bytes": dst_path.stat().st_size}
+            new_spec = "file:" + str(dst_path).replace("\\", "/")
+            if pkg:
+                spec_map[pkg] = new_spec
+            restored_local.append({"pkg": pkg, "dest": str(dst_path), "files": st["files"]})
+            info(f"  本地插件 {pkg}: {st['files']} 个文件 → {dst_path}")
+        if restored_local:
+            report["restored"].append(f"本地插件 {len(restored_local)} 个")
+
+        # ── 4) 逐 profile 建环境、装插件、放回补丁层与清单
+        for pdata in profs:
+            pname = pdata.get("name")
+            pdir = profile_dir(home, pname)
+            is_new_profile = not pdir.is_dir()
+            if is_new_profile:
+                info(f"② profile「{pname}」不存在，先建干净环境")
+                init_profile_dir(pdir, SHIPPED_TEMPLATES["web"])
+            files = pdata.get("files") or {}
+
+            # 4.0 先把 pnpm-workspace.yaml 的 allowBuilds 合并进去（git-hosted 插件
+            # 要靠它允许 prepare 构建；必须在 plugin add 之前就位）
+            if "pnpm-workspace.yaml" in files:
+                src_ws = zf.read(files["pnpm-workspace.yaml"]).decode("utf-8")
+                dst_ws = pdir / "pnpm-workspace.yaml"
+                if dst_ws.is_file():
+                    merged = _cfg_merge_workspace_allow_builds(
+                        dst_ws.read_text(encoding="utf-8"), src_ws)
+                    if merged != dst_ws.read_text(encoding="utf-8"):
+                        dst_ws.write_text(merged, encoding="utf-8")
+                else:
+                    _zip_extract_file(zf, files["pnpm-workspace.yaml"], dst_ws, hashes)
+
+            # 4.1 装第三方插件（官方组合包是宿主自带的，跳过）
+            plugins = pdata.get("plugins") or []
+            for plug in plugins:
+                pkg = plug.get("pkg")
+                if plug.get("official"):
+                    report["skipped"].append((f"{pname}/{pkg}", "宿主自带"))
+                    continue
+                src_spec = plug.get("spec") or ""
+                if str(src_spec).lower().startswith(("file:", "link:")):
+                    want = spec_map.get(pkg)
+                    if not want:
+                        report["failed"].append((f"{pname}/{pkg}",
+                                                 f"本地插件未包含在备份中：{src_spec}"))
+                        continue
+                elif NON_REGISTRY_SPEC_RE.match(src_spec):
+                    want = src_spec
+                else:
+                    want = plug.get("version") or src_spec
+                ok(f"  {pname}: 安装 {pkg} @ {want}")
+                res = run_plugin_cmd(cfg, lane, ["add", f"{pkg}@{want}", "--save-exact"],
+                                     label="cfg-restore", profile=pname, timeout=timeout)
+                if res.get("ok"):
+                    report["installed"].append(f"{pname}/{pkg}@{want}")
+                    info(f"    ✓ {pkg}")
+                else:
+                    tail = "\n".join(res.get("tail") or [])[-400:]
+                    why = res.get("error") or tail or f"rc={res.get('rc')}"
+                    report["failed"].append((f"{pname}/{pkg}", why))
+                    warn(f"    ✗ {pkg} 安装失败（见下，可稍后用「插件…」补装）")
+
+            # 4.2 补丁层：剥掉 webserver 端口块；备份条目合并进目标（同名条目不覆盖目标）
+            if "cordis.patch.yml" in files:
+                arc = files["cordis.patch.yml"]
+                text = zf.read(arc).decode("utf-8")
+                text = remove_patch_row_entries(text, ["webserver"])
+                dst_patch = pdir / "cordis.patch.yml"
+                if dst_patch.is_file():
+                    base = dst_patch.read_text(encoding="utf-8")
+                    blocks = [b for _id, b in _patch_entry_blocks(text) if _id]
+                    ok_m, why, merged, added = merge_patch_blocks(base, blocks)
+                    if ok_m:
+                        dst_patch.write_text(merged, encoding="utf-8")
+                        if added:
+                            info(f"  {pname}: 补丁层合并 {len(added)} 个条目")
+                else:
+                    dst_patch.write_text(text, encoding="utf-8")
+                    report["restored"].append(f"{pname} 补丁层")
+
+            # 4.3 bundles 登记补全（plugin add 偶尔不登记，照 transfer 的做法兜底）
+            bundles = [b for b in (pdata.get("bundles") or []) if b]
+            if bundles:
+                _merge_profile_manifest(pdir, {}, bundles)
+
+            # 4.4 compatibility.json：目标没有才放回（workspace 已在 4.0 处理）
+            if "compatibility.json" in files and not (pdir / "compatibility.json").is_file():
+                _zip_extract_file(zf, files["compatibility.json"],
+                                  pdir / "compatibility.json", hashes)
+
+        # ── 5) 会话（先另存现状，再覆盖，最后校验）
+        sess = contents.get("sessions") or {}
+        if use_sessions and sess.get("included") and sess.get("files"):
+            sdir = home / "sessions"
+            if sdir.exists():
+                snap = sessions_snapshot(cfg, lane, "before-cfg-restore")
+                info(f"③ 当前会话已另存为快照 {snap['name']}")
+                shutil.rmtree(sdir, ignore_errors=True)
+            st = _zip_extract_tree(zf, "sessions", sdir, hashes)
+            bad = _cfg_verify_tree(zf, "sessions", sdir, hashes)
+            if bad:
+                raise RuntimeError(f"会话恢复后校验失败：{len(bad)} 个文件不符，例如 {bad[:2]}")
+            info(f"  会话恢复 {st['files']} 个文件")
+            report["restored"].append(f"会话 {st['files']} 个")
+
+        att = contents.get("attachments") or {}
+        if use_sessions and att.get("included") and att.get("files"):
+            st = _zip_extract_tree(zf, "attachments", home / "attachments", hashes,
+                                   overwrite=False)
+            info(f"  附件恢复 {st['files']} 个（跳过已存在 {st['skipped']} 个）")
+            report["restored"].append(f"附件 {st['files']} 个")
+
+        # ── 6) 设置文件（已存在先留 .bak）
+        if use_settings:
+            n = 0
+            for item in (contents.get("settings") or {}).get("files") or []:
+                arc = item.get("zipPath")
+                dst = home / item.get("name")
+                if dst.is_file():
+                    _backup_file(dst)
+                _zip_extract_file(zf, arc, dst, hashes)
+                n += 1
+            if n:
+                info(f"④ 设置文件恢复 {n} 个")
+                report["restored"].append(f"设置 {n} 个")
+
+        # ── 7) 凭据（只合并 refs 条目，不冲掉目标已有的浏览器会话等）
+        cred = contents.get("credentials") or {}
+        if use_credentials and cred.get("included"):
+            arc = cred.get("zipPath")
+            text = zf.read(arc).decode("utf-8")
+            refs, _s, _e = _refs_block(text.splitlines())
+            if isinstance(refs, dict) and refs:
+                touched = merge_credential_refs(home / CRED_FILENAME, refs)
+                info(f"⑤ 凭据合并 {len(touched)} 条（已存在且相同的不动）")
+                report["restored"].append(f"凭据 {len(touched)} 条")
+            else:
+                warn("  备份里的凭据文件没有解析出 refs 条目，已跳过")
+
+        # ── 8) 插件数据目录（合并进 HOME，同名文件不覆盖）
+        if use_plugin_data:
+            for item in contents.get("pluginData") or []:
+                prefix = item.get("zipPrefix")
+                dst = home / item.get("name")
+                st = _zip_extract_tree(zf, prefix, dst, hashes, overwrite=False)
+                info(f"  数据目录 {item.get('name')}: {st['files']} 个文件")
+                report["restored"].append(f"{item.get('name')} {st['files']} 个")
+
+    # ── 9) 汇总
+    ok(f"配置恢复完成：lane「{lane}」")
+    for line in report["installed"]:
+        info(col(f"  ✓ 装回 {line}", C.GREEN))
+    for who, why in report["failed"]:
+        warn(f"  ✗ {who}: {why}")
+    if report["failed"]:
+        warn("  有插件没装回来：打开 lane 后到「插件…」里按包名补装，或重跑一次本恢复")
+    info(col(f"  现在可以：py {ME_NAME} open {lane}", C.CYAN))
+    return report
+
+
+def _cfg_verify_tree(zf: zipfile.ZipFile, prefix: str, dest_root: Path,
+                     hashes: dict[str, str]) -> list[str]:
+    """解压后按 manifest 指纹逐文件复核（只校验被记录过指纹的成员）。"""
+    bad: list[str] = []
+    prefix = prefix.strip("/") + "/"
+    for arc in zf.namelist():
+        if not arc.startswith(prefix) or arc not in hashes:
+            continue
+        rel = arc[len(prefix):]
+        on_disk = Path(dest_root) / rel
+        if not on_disk.is_file():
+            bad.append(f"{rel}（缺失）")
+            continue
+        if hashlib.sha256(on_disk.read_bytes()).hexdigest() != hashes[arc]:
+            bad.append(rel)
+    return bad
+
+
+# ---------- 备份包内插件的增删 ----------
+
+def _cfg_rewrite_zip(zip_path: Path, rewrite: dict[str, bytes]) -> None:
+    """重写 zip：rewrite 里的成员用新内容替换，其余成员原样拷贝（保留压缩方式）。"""
+    tmp = zip_path.with_suffix(".zip.tmp")
+    with zipfile.ZipFile(zip_path, "r") as zin, \
+            zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zout:
+        for item in zin.infolist():
+            if item.filename in rewrite:
+                continue
+            zout.writestr(item, zin.read(item.filename))
+        for arc, data in rewrite.items():
+            zinfo = zipfile.ZipInfo(arc)
+            zinfo.compress_type = zipfile.ZIP_DEFLATED
+            zout.writestr(zinfo, data)
+    os.replace(tmp, zip_path)
+
+
+def cfg_plugin_remove(zip_path: Path, pkgs: list[str], profile: str = "") -> dict:
+    """从备份包里删除插件：manifest + 每个 profile 的 package.json / 补丁层条目。"""
+    zip_path = Path(zip_path)
+    manifest = cfg_read_manifest(zip_path)
+    targets = set(pkgs)
+    rewrite: dict[str, bytes] = {}
+    removed: list[str] = []
+    for pdata in manifest.get("profiles") or []:
+        if profile and pdata.get("name") != profile:
+            continue
+        plugins = pdata.get("plugins") or []
+        rows_to_drop: set[str] = set()
+        drop = [x for x in plugins if x.get("pkg") in targets]
+        if not drop:
+            continue
+        for x in drop:
+            rows_to_drop.update(x.get("rows") or [])
+            rows_to_drop.update(x.get("disabledRows") or [])
+        kept = [x for x in plugins if x.get("pkg") not in targets]
+        pdata["plugins"] = kept
+        pdata["bundles"] = [b for b in (pdata.get("bundles") or []) if b not in targets]
+        removed.extend(f"{pdata.get('name')}/{x.get('pkg')}" for x in drop)
+        files = pdata.get("files") or {}
+        pkg_arc = files.get("package.json")
+        if pkg_arc:
+            with zipfile.ZipFile(zip_path) as zf:
+                pkg_data = json.loads(zf.read(pkg_arc).decode("utf-8"))
+            deps = pkg_data.get("dependencies")
+            if isinstance(deps, dict):
+                for t in targets:
+                    deps.pop(t, None)
+            dsh = pkg_data.get("dsh")
+            if isinstance(dsh, dict) and isinstance(dsh.get("profile"), dict):
+                bundles = dsh["profile"].get("bundles")
+                if isinstance(bundles, list):
+                    dsh["profile"]["bundles"] = [b for b in bundles if b not in targets]
+            rewrite[pkg_arc] = (json.dumps(pkg_data, ensure_ascii=False, indent=2)
+                                + "\n").encode("utf-8")
+        patch_arc = files.get("cordis.patch.yml")
+        if patch_arc and rows_to_drop:
+            with zipfile.ZipFile(zip_path) as zf:
+                text = zf.read(patch_arc).decode("utf-8")
+            rewrite[patch_arc] = remove_patch_row_entries(
+                text, sorted(rows_to_drop)).encode("utf-8")
+    if not removed:
+        raise ValueError("备份包里没有匹配的插件（可先用 cfg-show 看包内清单）")
+    rewrite["manifest.json"] = json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")
+    _cfg_rewrite_zip(zip_path, rewrite)
+    return {"removed": removed}
+
+
+def _cfg_parse_add_spec(text: str) -> tuple[str, str]:
+    """把 pkg@spec 拆成 (pkg, spec)。scoped 包 @scope/name@spec 按最后一个 @ 拆。"""
+    text = text.strip()
+    if text.startswith("@"):
+        pkg, sep, spec = text.rpartition("@")
+        return (pkg, spec) if sep else (text, "")
+    pkg, sep, spec = text.partition("@")
+    return pkg, (spec if sep else "")
+
+
+def cfg_plugin_add(zip_path: Path, profile_name: str, specs: list[str],
+                   src_cfg: dict | None = None, src_lane: str = "",
+                   src_profile: str = "") -> dict:
+    """往备份包里加插件。
+
+    · 只给 pkg@spec：按该 spec 登记，恢复时联网拉取（没有开关状态，装完默认启用）。
+    · 给了 --from lane/profile：从本机那条 lane 采到实际版本、行 id 与补丁条目
+      （file: 本地依赖还会一并收进备份）。
+    profile 不存在时自动在备份里新建一份。
+    """
+    zip_path = Path(zip_path)
+    manifest = cfg_read_manifest(zip_path)
+    profs = manifest.get("profiles")
+    if not isinstance(profs, list):
+        profs = []
+        manifest["profiles"] = profs
+    pdata = next((p for p in profs if p.get("name") == profile_name), None)
+    if pdata is None:
+        pdata = {"name": profile_name, "bundles": [], "files": {}, "plugins": []}
+        profs.append(pdata)
+    pdata.setdefault("plugins", [])
+    pdata.setdefault("bundles", [])
+    pdata.setdefault("files", {})
+    existing = {x.get("pkg") for x in pdata["plugins"]}
+
+    added: list[str] = []
+    extra_local = []
+    for raw in specs:
+        pkg, spec = _cfg_parse_add_spec(raw)
+        if not pkg or pkg == "desktop":
+            continue
+        entry = {"pkg": pkg, "spec": spec or "latest", "version": "",
+                 "inBundles": True, "official": pkg.startswith("@deepseek-ai/"),
+                 "kind": "bundle", "rows": [], "disabledRows": [],
+                 "localSpec": (spec if str(spec).lower().startswith(("file:", "link:")) else "")}
+        # 从本机已有 lane 采集：实际版本 + 行 id + 补丁条目 + 本地依赖
+        src_blocks_text: list[str] = []
+        if src_cfg and src_lane and src_lane in src_cfg.get("lanes", {}):
+            src_prof = src_profile or DEFAULT_PROFILE
+            for found in profile_plugins(src_cfg, src_lane, src_prof, include_official=True):
+                if found.get("pkg") != pkg:
+                    continue
+                entry.update({
+                    "spec": found.get("spec") or spec or entry["spec"],
+                    "version": found.get("version") or "",
+                    "kind": found.get("kind") or "bundle",
+                    "rows": found.get("rows") or [],
+                    "disabledRows": found.get("disabled_rows") or [],
+                    "localSpec": found.get("spec") if str(
+                        found.get("spec") or "").lower().startswith(("file:", "link:")) else "",
+                })
+                sp = profile_dir(lane_home(src_cfg, src_lane), src_prof) / "cordis.patch.yml"
+                if sp.is_file():
+                    blocks = patch_blocks_for_ids(sp.read_text(encoding="utf-8"),
+                                                  set(found.get("rows") or []))
+                    src_blocks_text = [ln for block in blocks for ln in block]
+                if entry["localSpec"]:
+                    extra_local.extend(cfg_collect_local_specs(
+                        lane_home(src_cfg, src_lane), [src_prof]))
+                break
+        if pkg in existing:
+            # 已存在：更新版本/规格，不重复加
+            for i, x in enumerate(pdata["plugins"]):
+                if x.get("pkg") == pkg:
+                    pdata["plugins"][i] = entry
+        else:
+            pdata["plugins"].append(entry)
+            existing.add(pkg)
+        if entry["inBundles"] and pkg not in pdata["bundles"]:
+            pdata["bundles"].append(pkg)
+        added.append(pkg)
+
+    if not added:
+        raise ValueError("没有可加入的插件")
+
+    rewrite: dict[str, bytes] = {}
+    with zipfile.ZipFile(zip_path) as zf:
+        names = set(zf.namelist())
+        # package.json：登记 deps + bundles
+        arc = f"profiles/{profile_name}/package.json"
+        if arc in names:
+            pkg_data = json.loads(zf.read(arc).decode("utf-8"))
+        else:
+            pkg_data = {"name": f"dsh-profile-{profile_name}", "private": True,
+                        "dependencies": {}, "dsh": {"profile": {"bundles": []}}}
+        deps = pkg_data.setdefault("dependencies", {})
+        for entry in pdata["plugins"]:
+            # 包内清单就是权威：本地依赖写新 file 路径，其次精确版本，最后原始 spec
+            deps[entry["pkg"]] = entry["localSpec"] or entry["version"] or entry["spec"]
+        dsh = pkg_data.setdefault("dsh", {}).setdefault("profile", {})
+        dsh["bundles"] = pdata["bundles"]
+        rewrite[arc] = (json.dumps(pkg_data, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        pdata["files"]["package.json"] = arc
+        # 补丁层：追加采集到的条目
+        patch_arc = f"profiles/{profile_name}/cordis.patch.yml"
+        base = zf.read(patch_arc).decode("utf-8") if patch_arc in names else ""
+        if src_blocks_text:
+            ok_d, why, new_text = append_patch_entries(base, src_blocks_text)
+            if ok_d:
+                rewrite[patch_arc] = new_text.encode("utf-8")
+                pdata["files"]["cordis.patch.yml"] = patch_arc
+
+    # 本地依赖：去重后收进 zip
+    contents = manifest.setdefault("contents", {})
+    local_items = contents.setdefault("localFiles", [])
+    for item in extra_local:
+        if any(x.get("sourcePath") == item["sourcePath"] for x in local_items):
+            continue
+        src = Path(item["sourcePath"])
+        if not src.exists():
+            continue
+        key = item["key"] = f"{len(local_items):02d}-{re.sub(r'[^A-Za-z0-9._-]+', '-', src.name).strip('-')[:40]}"
+        prefix = f"local/{key}"
+        item["zipPath"] = prefix if item["isDir"] else f"{prefix}/{src.name}"
+        item["bytes"] = dir_size(src) if item["isDir"] else src.stat().st_size
+        item["files"] = 0
+        local_items.append(item)
+    hashes = manifest.setdefault("hashes", {})
+    with zipfile.ZipFile(zip_path, "a") as zf:
+        for item in extra_local:
+            if not any(h.startswith(f"local/{item['key']}") for h in hashes):
+                src = Path(item["sourcePath"])
+                if item["isDir"]:
+                    st = _zip_add_tree(zf, src, f"local/{item['key']}", False, hashes)
+                else:
+                    _zip_add_bytes(zf, item["zipPath"], src.read_bytes(), hashes)
+    rewrite["manifest.json"] = json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")
+    _cfg_rewrite_zip(zip_path, rewrite)
+    return {"added": added}
+
+
+# ---------- 配置备份 CLI ----------
+
+def cmd_cfg_backup(cfg: dict, args) -> int:
+    """把一条 lane 的插件清单 + 会话 + 设置打成一个轻量 zip（不复制插件本体/安装树）。"""
+    lane = args.lane
+    if lane not in cfg.get("lanes", {}):
+        fail(f"没有 lane「{lane}」")
+        return 1
+    plan = cfg_backup_plan(
+        cfg, lane,
+        sessions=not args.no_sessions,
+        attachments=not args.no_attachments,
+        settings=not args.no_settings,
+        credentials=bool(args.credentials),
+        plugin_data=args.data or [],
+        profile_names=args.profiles,
+    )
+    if not plan["ok"]:
+        fail(plan["why"])
+        return 1
+    if args.data:
+        avail = {d["name"] for d in plan["dataDirs"]}
+        bad = [d for d in args.data if d not in avail]
+        if bad:
+            fail(f"这几个数据目录不存在：{'、'.join(bad)}")
+            return 1
+    ok(f"配置备份：lane「{lane}」（dsh {plan['dshVersion']}）")
+    for p in plan["profiles"]:
+        info(f"  profile「{p['name']}」: {p['thirdParty']} 个第三方插件"
+             + (f"（缺清单文件 {p['missingFiles']}）" if p["missingFiles"] else ""))
+    if plan["sessions"]["files"]:
+        info(f"  会话 {plan['sessions']['files']} 个文件 / {human_size(plan['sessions']['bytes'])}")
+    if plan["attachments"]["files"]:
+        info(f"  附件 {plan['attachments']['files']} 个 / "
+             f"{human_size(plan['attachments']['bytes'])}")
+    info(f"  设置文件 {len(plan['settingsFiles'])} 个")
+    if plan["credentials"]:
+        info(col(f"  凭据 {len(plan['credentials'])} 条（敏感，已按要求打入）", C.YELLOW))
+    if plan["localFiles"]:
+        info(f"  本地插件 {len(plan['localFiles'])} 个 / "
+             f"{human_size(sum(x['bytes'] for x in plan['localFiles']))}")
+    if plan["dataPicked"]:
+        info(f"  插件数据目录 {len(plan['dataPicked'])} 个 / "
+             f"{human_size(sum(x['bytes'] for x in plan['dataPicked']))}")
+    info(col(f"  合计约 {human_size(plan['totalBytes'])}（不含 profiles 下的插件本体）", C.GRAY))
+    if not args.yes and sys.stdin and getattr(sys.stdin, "isatty", lambda: False)():
+        if input("开始打包？(回车继续 / n 取消)：").strip().lower() in ("n", "q"):
+            warn("已取消")
+            return 1
+    manifest = cfg_create_backup(
+        cfg, lane, label=getattr(args, "name", "") or "",
+        sessions=not args.no_sessions,
+        attachments=not args.no_attachments,
+        settings=not args.no_settings,
+        credentials=bool(args.credentials),
+        plugin_data=args.data or [],
+        profile_names=args.profiles,
+    )
+    ok(f"备份完成：{manifest['zip']}")
+    info(col("  恢复到新版本：py " + ME_NAME + " cfg-restore \"" + manifest["name"]
+             + "\" --new-lane 新lane名 --version 版本", C.CYAN))
+    return 0
+
+
+def cmd_cfg_list(cfg: dict, args) -> int:
+    items = cfg_list_backups(cfg)
+    if not items:
+        warn(f"还没有配置备份（{cfg_backup_root(cfg)}）")
+        return 0
+    info(f"配置备份（{cfg_backup_root(cfg)}）：")
+    for item in items:
+        if not item["ok"]:
+            info(col(f"  [损坏] {item['name']}  {human_size(item['bytes'])}  {item['error']}",
+                     C.RED))
+            continue
+        line = (f"  {item['name']}  {human_size(item['bytes'])}"
+                f"  来源 {item['sourceLane']}@{item['dshVersion']}"
+                f"  profile {','.join(item['profiles'])}"
+                f"  插件 {item['thirdParty']}  会话 {item['sessions']}")
+        if item["credentials"]:
+            line += "  含凭据"
+        info(line)
+    return 0
+
+
+def _cfg_print_show(manifest: dict, zip_path: Path) -> None:
+    s = cfg_summary(manifest)
+    src = s["source"]
+    ok(f"配置备份：{zip_path.name}")
+    info(f"  打包时间  : {s['created']}")
+    info(f"  来源 lane : {src.get('lane', '?')}（dsh {src.get('dshVersion', '?')}）")
+    info(f"  来源 HOME : {src.get('home', '?')}")
+    for p in s["profiles"]:
+        third = p["thirdParty"]
+        info(f"  profile「{p['name']}」: {len(third)} 个第三方插件"
+             + (f"，官方组合包 {p['officialCount']} 个" if p["officialCount"] else ""))
+        for x in third:
+            state = "关闭" if x.get("disabledRows") else "启用"
+            info(col(f"      {x.get('pkg')}  {x.get('version') or x.get('spec') or '?'}  "
+                     f"[{x.get('kind')}]  {state}", C.GRAY))
+    sess = s["sessions"]
+    if sess.get("included"):
+        info(f"  会话      : {sess.get('files', 0)} 个文件 / {human_size(sess.get('bytes', 0))}")
+    att = s["attachments"]
+    if att.get("included"):
+        info(f"  附件      : {att.get('files', 0)} 个 / {human_size(att.get('bytes', 0))}")
+    if s["settings"].get("included"):
+        names = [f["name"] for f in s["settings"].get("files") or []]
+        info(f"  设置文件  : {len(names)} 个 —— {', '.join(names)}")
+    if s["credentials"].get("included"):
+        info(col(f"  凭据      : {len(s['credentials'].get('entries') or [])} 条"
+                 f"（{', '.join(s['credentials'].get('entries') or [])}）—— 敏感", C.YELLOW))
+    else:
+        info("  凭据      : 不含")
+    if s["localFiles"]:
+        info(f"  本地插件  : {len(s['localFiles'])} 个")
+        for x in s["localFiles"]:
+            info(col(f"      {x.get('pkg')}  ← {x.get('sourcePath')}", C.GRAY))
+    if s["pluginData"]:
+        info(f"  数据目录  : {', '.join(x['name'] for x in s['pluginData'])}")
+
+
+def cmd_cfg_show(cfg: dict, args) -> int:
+    try:
+        zip_path = cfg_resolve_backup(cfg, args.backup)
+        manifest = cfg_read_manifest(zip_path)
+    except (OSError, ValueError, FileNotFoundError) as exc:
+        fail(str(exc))
+        return 1
+    _cfg_print_show(manifest, zip_path)
+    return 0
+
+
+def cmd_cfg_rm(cfg: dict, args) -> int:
+    try:
+        zip_path = cfg_resolve_backup(cfg, args.backup)
+    except (OSError, FileNotFoundError) as exc:
+        fail(str(exc))
+        return 1
+    if not args.yes and sys.stdin and getattr(sys.stdin, "isatty", lambda: False)():
+        if input(f"删掉 {zip_path}？(y/N)：").strip().lower() not in ("y", "yes"):
+            warn("已取消")
+            return 1
+    zip_path.unlink()
+    ok(f"已删除 {zip_path}")
+    return 0
+
+
+def cmd_cfg_restore(cfg: dict, args) -> int:
+    try:
+        zip_path = cfg_resolve_backup(cfg, args.backup)
+        manifest = cfg_read_manifest(zip_path)
+    except (OSError, ValueError, FileNotFoundError) as exc:
+        fail(str(exc))
+        return 1
+    profs = args.profiles
+    plan = cfg_restore_plan(
+        cfg, manifest, target=args.lane or "", new_lane=args.new_lane or "",
+        version=args.version or "", profiles=profs,
+        sessions=not args.no_sessions, settings=not args.no_settings,
+        credentials=not args.no_credentials, plugin_data=not args.no_data,
+    )
+    if not plan["ok"]:
+        fail("无法恢复：")
+        for p in plan["problems"]:
+            fail("  - " + p)
+        return 1
+    if plan["mode"] == "new":
+        info(f"新建 lane「{plan['target']}」（dsh {plan['version']}），再从备份恢复")
+    else:
+        info(f"往已有 lane「{plan['target']}」里恢复")
+    info(f"  profile : {', '.join(plan['profiles'])}")
+    info(f"  要装回的第三方插件 {len(plan['thirdParty'])} 个")
+    for x in plan["thirdParty"]:
+        info(col(f"      {x['profile']}/{x['pkg']}  {x['want']}"
+                 + ("（本地）" if x["local"] else ""), C.GRAY))
+    if plan["sessions"].get("included") and not args.no_sessions:
+        info(f"  会话 {plan['sessions'].get('files', 0)} 个（现有会话会先另存）")
+    if plan["credentials"].get("included") and args.no_credentials:
+        info(col("  凭据：备份里含凭据，但按参数跳过", C.YELLOW))
+    if plan["running"]:
+        if not args.yes:
+            fail("目标 lane 正在运行：恢复会先停掉它。确认后重跑（或加 --yes）")
+            return 1
+    if not args.yes and sys.stdin and getattr(sys.stdin, "isatty", lambda: False)():
+        if input("开始恢复？(回车继续 / n 取消)：").strip().lower() in ("n", "q"):
+            warn("已取消")
+            return 1
+    cfg_restore(cfg, zip_path, target=args.lane or "", new_lane=args.new_lane or "",
+                version=args.version or "", profiles=profs,
+                use_sessions=not args.no_sessions,
+                use_settings=not args.no_settings,
+                use_credentials=not args.no_credentials,
+                use_plugin_data=not args.no_data,
+                stop=True)
+    return 0
+
+
+def cmd_cfg_plugins(cfg: dict, args) -> int:
+    try:
+        zip_path = cfg_resolve_backup(cfg, args.backup)
+        manifest = cfg_read_manifest(zip_path)
+    except (OSError, ValueError, FileNotFoundError) as exc:
+        fail(str(exc))
+        return 1
+    for pdata in manifest.get("profiles") or []:
+        if args.profile and pdata.get("name") != args.profile:
+            continue
+        info(f"profile「{pdata.get('name')}」：")
+        for x in pdata.get("plugins") or []:
+            tag = "官方" if x.get("official") else ("关闭" if x.get("disabledRows") else "启用")
+            info(f"  {x.get('pkg')}  {x.get('version') or x.get('spec') or '?'}  [{tag}]")
+    return 0
+
+
+def cmd_cfg_plugin_add(cfg: dict, args) -> int:
+    try:
+        zip_path = cfg_resolve_backup(cfg, args.backup)
+        src_cfg = load_config() if args.from_lane else None
+        result = cfg_plugin_add(zip_path, args.profile, args.plugins,
+                                src_cfg=src_cfg, src_lane=args.from_lane or "",
+                                src_profile=args.from_profile or "")
+    except (OSError, ValueError, FileNotFoundError) as exc:
+        fail(str(exc))
+        return 1
+    ok(f"已加入备份 {len(result['added'])} 个插件：{', '.join(result['added'])}")
+    if args.from_lane:
+        info("版本、开关状态与补丁配置已从源 lane 采集；本地依赖已一并收入")
+    else:
+        info("恢复时按规格联网拉取（装完默认启用；要带开关状态就用 --from 从已有 lane 采集）")
+    return 0
+
+
+def cmd_cfg_plugin_rm(cfg: dict, args) -> int:
+    try:
+        zip_path = cfg_resolve_backup(cfg, args.backup)
+        result = cfg_plugin_remove(zip_path, args.plugins, profile=args.profile or "")
+    except (OSError, ValueError, FileNotFoundError) as exc:
+        fail(str(exc))
+        return 1
+    ok(f"已从备份移除：{', '.join(result['removed'])}")
+    return 0
+
+
 def lane_delete_plan(cfg: dict, lane: str, sizes: bool = True) -> dict:
     """算清"删掉这条 lane"具体会动哪些文件，供 GUI / CLI 展示与确认。
 
@@ -6740,47 +8955,40 @@ def cmd_delete(cfg: dict, args) -> int:
         for log_path in plan["logs"]:
             if Path(log_path).is_file():
                 info(f"    · 启动日志    {log_path}")
-    if del_install:
-        info(f"    · 安装树      {plan['install']}　({human_size(plan['install_size'])})")
-        if plan["profiles"]:
-            info(col(f"                  （含全部 profile 目录，插件组合无法找回）", C.GRAY))
-    if del_home:
-        info(f"    · DSH_HOME    {plan['home']}　({human_size(plan['home_size'])})")
-        info(col("                  （会话记录、设置、凭据一并消失，无法恢复）", C.GRAY))
-        info("  将被保留：")
-        if not del_install:
-            why = (
-                "接管型：删的是 npm 全局那份，本启动器不动它（要卸载用 npm uninstall -g）"
-                if plan["adopted"]
-                else f"其它 lane 还在用同一棵安装树：{'、'.join(plan['shared_with'])}"
-            )
-            info(f"    · 安装树      {plan['install']}")
-            info(col(f"                  （{why}）", C.GRAY))
-        if not del_home:
-            if args.keep_home:
-                why = "你选了保留（--keep-home）"
-            else:
-                why = "不在 lane 根目录里（像是你现有的 HOME），删它会连真实会话一起清掉"
+        if del_install:
+            info(f"    · 安装树      {plan['install']}　({human_size(plan['install_size'])})")
+            if plan["profiles"]:
+                info(col(f"                  （含全部 profile 目录，插件组合无法找回）", C.GRAY))
+        if del_home:
             info(f"    · DSH_HOME    {plan['home']}　({human_size(plan['home_size'])})")
-            info(col(f"                  （{why}）", C.GRAY))
-            if not plan["home_inside"] and not args.keep_home:
-                info(col("                  想连它一起删，加 --home-too（危险）", C.GRAY))
-        if rt:
-            if not args.stop:
-                info("")
-                warn(f"它现在正在运行（pid {rt.get('pid')}，端口 {rt.get('port')}）。")
-                warn(f"加 --stop 让它先停下来再删：delete {lane} --stop")
+            info(col("                  （会话记录、设置、凭据一并消失，无法恢复）", C.GRAY))
+            info("  将被保留：")
+            if not del_install:
+                why = (
+                    "接管型：删的是 npm 全局那份，本启动器不动它（要卸载用 npm uninstall -g）"
+                    if plan["adopted"]
+                    else f"其它 lane 还在用同一棵安装树：{'、'.join(plan['shared_with'])}"
+                )
+                info(f"    · 安装树      {plan['install']}")
+                info(col(f"                  （{why}）", C.GRAY))
+            if rt:
+                if not args.stop:
+                    info("")
+                    warn(f"它现在正在运行（pid {rt.get('pid')}，端口 {rt.get('port')}）。")
+                    warn(f"加 --stop 让它先停下来再删：delete {lane} --stop")
+                    return 1
+                info(col(f"      （会先停止 pid {rt.get('pid')}）", C.GRAY))
+            info("")
+            try:
+                typed = input(f"  请输入「{lane}」以确认删除（其它任意输入＝取消）：").strip()
+            except (EOFError, KeyboardInterrupt):
+                typed = ""
+            if typed != lane:
+                warn("已取消，什么都没有删除。")
                 return 1
-            info(col(f"      （会先停止 pid {rt.get('pid')}）", C.GRAY))
-        info("")
-        try:
-            typed = input(f"  请输入「{lane}」以确认删除（其它任意输入＝取消）：").strip()
-        except (EOFError, KeyboardInterrupt):
-            typed = ""
-        if typed != lane:
-            warn("已取消，什么都没有删除。")
-            return 1
     elif rt and not args.stop:
+        # --yes（GUI / Web 界面）：那边的二次确认（手打 lane 名）已经在窗口里做过了，
+        # 所以这里只补一条它做不了的检查 —— 正在运行又没让先停。
         fail(f"lane「{lane}」正在运行（pid {rt.get('pid')}）。先 stop，或加 --stop。")
         return 1
 
@@ -6988,6 +9196,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_clone.add_argument("source", help="源 lane 名或版本号（建议填主要版本）")
     p_clone.add_argument("lane", help="新 lane 名，例如 test-next")
     p_clone.add_argument("--port", type=int, help="指定端口（默认自动挑空闲端口）")
+    p_clone.add_argument(
+        "--profiles", metavar="名,名",
+        help="只复制这些 profile（逗号分隔，如 web,test）；缺省＝源 HOME 里全部 "
+             "（没选的 profile 不进副本，装机体积也跟着小）")
 
     p_upgrade = sub.add_parser(
         "upgrade",
@@ -7022,6 +9234,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_plugins.add_argument("--profile", help="看哪个 profile（默认 web）")
     p_plugins.add_argument("--dump", action="store_true",
                            help="额外离线组合一次，核对「文件说的」与「组合结果」是否一致")
+
+    p_transfer = sub.add_parser(
+        "plugin-transfer",
+        help="把插件搬到别的 profile / 别的版本（默认点名到同一个版本重装，也可离线直拷）",
+    )
+    p_transfer.add_argument("lane", help="源：lane 或 lane/profile（缺 profile 用 web）")
+    p_transfer.add_argument("to", help="目标：lane 或 lane/profile（缺 profile 用 web）")
+    p_transfer.add_argument("names", nargs="+",
+                            help="要搬的插件包名（可多个；写 all ＝源里全部第三方插件）")
+    p_transfer.add_argument("--mode", choices=list(PLUGIN_TRANSFER_MODES), default="install",
+                            help="install＝点名到同一个版本重装（默认，pnpm 账本干净）；"
+                                 "copy＝离线直拷（不走网络、不需要 node）")
+    p_transfer.add_argument("--dry-run", dest="dry_run", action="store_true",
+                            help="只打印计划与逐条动作，不做任何改动")
+    p_transfer.add_argument("--timeout", type=int, default=1800, help="单个插件安装的超时秒数")
 
     p_plugin_off = sub.add_parser(
         "plugin-off", help="关掉一个插件（写它的真实行 id；运行中的话约 2 秒热生效，不用重启）"
@@ -7120,6 +9347,64 @@ def build_parser() -> argparse.ArgumentParser:
     p_chat_rm.add_argument("name")
     p_chat_rm.add_argument("--yes", action="store_true", help="跳过确认（GUI / 脚本用）")
 
+    # ── 配置备份（轻量：插件清单 + 会话 + 设置；恢复时自动联网拉回插件）──
+    p_cfg_bk = sub.add_parser(
+        "cfg-backup",
+        help="把这条 lane 的插件清单+会话+设置打成一个轻量 zip（不含插件本体/安装树）"
+    )
+    p_cfg_bk.add_argument("lane")
+    p_cfg_bk.add_argument("--name", help="给这份备份起个后缀名，例如 before-reinstall")
+    p_cfg_bk.add_argument("--no-sessions", action="store_true", help="不带会话记录")
+    p_cfg_bk.add_argument("--no-attachments", action="store_true", help="不带会话附件")
+    p_cfg_bk.add_argument("--no-settings", action="store_true", help="不带设置文件")
+    p_cfg_bk.add_argument("--credentials", action="store_true",
+                          help="连凭据（API key 等）一起打包（敏感，默认不带）")
+    p_cfg_bk.add_argument("--data", action="append", metavar="目录名",
+                          help="额外打包 HOME 下的插件数据目录（可多次给）")
+    p_cfg_bk.add_argument("--profiles", nargs="+", help="只备份这几个 profile（默认全部）")
+    p_cfg_bk.add_argument("--yes", action="store_true", help="跳过确认")
+
+    p_cfg_ls = sub.add_parser("cfg-list", help="列出全部配置备份包")
+
+    p_cfg_show = sub.add_parser("cfg-show", help="查看一个配置备份包里有什么（插件/会话/设置）")
+    p_cfg_show.add_argument("backup", help="备份名（可不带 .zip）或 zip 路径")
+
+    p_cfg_rm = sub.add_parser("cfg-rm", help="删掉一个配置备份包")
+    p_cfg_rm.add_argument("backup")
+    p_cfg_rm.add_argument("--yes", action="store_true")
+
+    p_cfg_rs = sub.add_parser(
+        "cfg-restore",
+        help="把配置备份恢复进 lane：新建 lane 自动装 dsh 后按清单联网拉回插件，或导入已有 lane"
+    )
+    p_cfg_rs.add_argument("backup", help="备份名（可不带 .zip）或 zip 路径")
+    p_cfg_rs.add_argument("lane", nargs="?", help="目标 lane（已存在）；不填就要用 --new-lane")
+    p_cfg_rs.add_argument("--new-lane", help="新建一条 lane 并恢复到它里面")
+    p_cfg_rs.add_argument("--version", help="新建 lane 时装的 dsh 版本（默认用备份里的版本）")
+    p_cfg_rs.add_argument("--profiles", nargs="+", help="只恢复这几个 profile（默认全部）")
+    p_cfg_rs.add_argument("--no-sessions", action="store_true", help="不恢复会话")
+    p_cfg_rs.add_argument("--no-settings", action="store_true", help="不恢复设置文件")
+    p_cfg_rs.add_argument("--no-credentials", action="store_true", help="即使备份含凭据也不合并")
+    p_cfg_rs.add_argument("--no-data", action="store_true", help="不恢复插件数据目录")
+    p_cfg_rs.add_argument("--yes", action="store_true", help="跳过确认（运行中的 lane 会先停）")
+
+    p_cfg_pl = sub.add_parser("cfg-plugins", help="列出备份包内每个 profile 的插件")
+    p_cfg_pl.add_argument("backup")
+    p_cfg_pl.add_argument("--profile", help="只看这一个 profile")
+
+    p_cfg_pa = sub.add_parser("cfg-plugin-add",
+                              help="往备份包里加插件（pkg@spec；可从本机已有 lane 采集版本与开关）")
+    p_cfg_pa.add_argument("backup")
+    p_cfg_pa.add_argument("profile", help="加进备份里的哪个 profile（不存在会新建）")
+    p_cfg_pa.add_argument("plugins", nargs="+", help="pkg@spec，例如 @scope/foo@1.2.3")
+    p_cfg_pa.add_argument("--from-lane", help="从本机这条 lane 采集实际版本/开关/补丁")
+    p_cfg_pa.add_argument("--from-profile", help="从源 lane 的哪个 profile 采集（默认 web）")
+
+    p_cfg_pr = sub.add_parser("cfg-plugin-rm", help="从备份包里删除插件")
+    p_cfg_pr.add_argument("backup")
+    p_cfg_pr.add_argument("plugins", nargs="+", help="要删的包名")
+    p_cfg_pr.add_argument("--profile", help="只在这个 profile 里删（默认所有 profile）")
+
     return parser
 
 
@@ -7177,6 +9462,7 @@ def main() -> int:
         "upgrade": cmd_upgrade,
         "verify": cmd_verify,
         "plugins": cmd_plugins,
+        "plugin-transfer": cmd_plugin_transfer,
         "plugin-off": cmd_plugins_write_disabled,
         "plugin-on": cmd_plugins_write_disabled,
         "plugins-off": cmd_plugins_write_disabled,
@@ -7190,6 +9476,14 @@ def main() -> int:
         "chat-list": cmd_chat_list,
         "chat-restore": cmd_chat_restore,
         "chat-rm": cmd_chat_rm,
+        "cfg-backup": cmd_cfg_backup,
+        "cfg-list": cmd_cfg_list,
+        "cfg-show": cmd_cfg_show,
+        "cfg-rm": cmd_cfg_rm,
+        "cfg-restore": cmd_cfg_restore,
+        "cfg-plugins": cmd_cfg_plugins,
+        "cfg-plugin-add": cmd_cfg_plugin_add,
+        "cfg-plugin-rm": cmd_cfg_plugin_rm,
     }
     try:
         return handlers[args.command](cfg, args)

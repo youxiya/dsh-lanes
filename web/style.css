@@ -1,0 +1,1311 @@
+/* ============================================================================
+   DSH 多版本启动器 —— Web 前端样式
+   ----------------------------------------------------------------------------
+   和 tkinter 版的对应关系（配色逐项对齐 dsh_lanes_gui.py 的 THEMES）：
+
+     tkinter 版                         这里
+     ─────────────────────────────────  ──────────────────────────────────────
+     极光背景（后台线程渲染 PPM +        .aurora / .blob（CSS 渐变，色斑用
+       zoom 放大贴到 Canvas 上）          transform 在合成器线程上漂移）
+     GlassPanel（按坐标从背景图取样      .glass（backdrop-filter 真模糊；
+       平均色 + 采样圆角画平滑多边形）    圆角交给 border-radius）
+     换主题＝销毁重建全部控件            html[data-theme] 改 CSS 变量，
+                                          颜色属性带 transition，背景交叉淡入
+     展开/收起＝手工算 12 帧高度         .prof-body 的 grid-template-rows 0fr→1fr
+
+   性能上的两条硬规矩（都是"帧数"的来源）：
+     ① 动画只碰 transform / opacity —— 这两个属性由合成器线程处理，主线程不被拖住；
+     ② 大面积的滚动区域（日志）不挂 backdrop-filter —— 滚动时每帧重新模糊整块文本太贵，
+        改成接近不透明的底色。玻璃感留给面板与卡片。
+   ========================================================================= */
+
+/* ── 主题变量 ────────────────────────────────────────────────────────────── */
+
+:root,
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --bg: #e8ecf6;
+  --text: #141922;
+  --muted: #59637a;
+  --faint: #98a2b6;
+
+  --panel-solid: #fbfcfe;
+  --card-solid: #ffffff;
+  --panel: rgba(251, 252, 254, 0.72);
+  --card: rgba(255, 255, 255, 0.76);
+  --log-bg: rgba(250, 251, 254, 0.94);
+
+  --border: #d7ddea;
+  --border-soft: #e9edf5;
+  --shadow-rgb: 142, 151, 172;
+  --hl: rgba(255, 255, 255, 0.65);
+
+  --accent: #4d6bfe;
+  --accent-dk: #2f4bd8;
+  --accent-soft: #e9edff;
+  --green: #0e9f5b;
+  --green-bg: #e2f6eb;
+  --gray: #98a1b2;
+  --gray-bg: #eef1f6;
+  --red: #d92d2d;
+  --red-bg: #fdeaea;
+  --amber: #a05f0a;
+  --amber-bg: #fcefdc;
+  --input-bg: #f6f8fd;
+  --btn-bg: #ebeff8;
+  --btn-bg-on: #dce3f3;
+  --btn-fg: #1d2536;
+  --sel: rgba(77, 107, 254, 0.22);
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg: #0a0d16;
+  --text: #e8ecf5;
+  --muted: #98a3b9;
+  --faint: #67718a;
+
+  --panel-solid: #151a26;
+  --card-solid: #181e2b;
+  --panel: rgba(21, 26, 38, 0.66);
+  --card: rgba(24, 30, 43, 0.72);
+  --log-bg: rgba(14, 18, 27, 0.94);
+
+  --border: #2a3346;
+  --border-soft: #212838;
+  --shadow-rgb: 3, 5, 10;
+  --hl: rgba(255, 255, 255, 0.06);
+
+  --accent: #7e96ff;
+  --accent-dk: #a3b4ff;
+  --accent-soft: #1e2740;
+  --green: #3fd68c;
+  --green-bg: #122c21;
+  --gray: #6c7690;
+  --gray-bg: #1d2431;
+  --red: #ff6b6b;
+  --red-bg: #2e1618;
+  --amber: #f0b45e;
+  --amber-bg: #2c2314;
+  --input-bg: #10151f;
+  --btn-bg: #232b3e;
+  --btn-bg-on: #313b52;
+  --btn-fg: #e8ecf5;
+  --sel: rgba(126, 150, 255, 0.26);
+}
+
+/* 颜色有关的过渡时长：换主题时靠它"淡"过去，而不是"闪"一下 */
+:root {
+  --t-color: 0.26s;
+  --t-move: 0.32s;
+  --ease: cubic-bezier(0.4, 0, 0.2, 1);
+  --radius-panel: 14px;
+  --radius-card: 10px;
+}
+
+/* ── 重置与排版 ──────────────────────────────────────────────────────────── */
+
+* { box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.5 "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", system-ui, sans-serif;
+  overflow: hidden;
+  transition: background-color var(--t-color) var(--ease), color var(--t-color) var(--ease);
+}
+
+h1, h2, h3, p { margin: 0; }
+b, strong { font-weight: 600; }
+
+.mono {
+  font-family: Consolas, "Cascadia Mono", ui-monospace, monospace;
+}
+
+::selection { background: var(--sel); }
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* ── 极光背景 ─────────────────────────────────────────────────────────────
+   两层（浅色层 + 深色层）叠在一起，换主题时只改两层的不透明度 → 背景是"化"过去的。
+   色斑用 radial-gradient 一次栅格化，之后只做 transform 漂移，全程不碰主线程。 */
+
+.aurora {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  overflow: hidden;
+  pointer-events: none;
+  contain: strict;              /* 内部变化不影响外部布局，浏览器可以放心优化 */
+}
+
+.aurora .layer {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  transition: opacity 0.55s var(--ease);
+}
+
+.aurora .layer[data-t="light"] {
+  opacity: 1;
+  background-image: linear-gradient(180deg, #f7f9ff 0%, #e4eafa 100%);
+}
+
+.aurora .layer[data-t="dark"] {
+  background-image: linear-gradient(180deg, #0e121e 0%, #060910 100%);
+}
+
+:root[data-theme="dark"] .aurora .layer[data-t="light"] { opacity: 0; }
+:root[data-theme="dark"] .aurora .layer[data-t="dark"] { opacity: 1; }
+
+.blob {
+  position: absolute;
+  left: calc(var(--x) * 100%);
+  top: calc(var(--y) * 100%);
+  width: var(--d);
+  height: var(--d);
+  border-radius: 50%;
+  transform: translate3d(-50%, -50%, 0);
+  background: radial-gradient(circle closest-side, var(--c) 0%, transparent 72%);
+  will-change: transform;
+  animation: drift var(--dur, 26s) ease-in-out infinite alternate;
+  animation-delay: var(--delay, 0s);
+}
+
+@keyframes drift {
+  from { transform: translate3d(-50%, -50%, 0) scale(1); }
+  to   { transform: translate3d(calc(-50% + 3.2%), calc(-50% - 2.4%), 0) scale(1.09); }
+}
+
+/* 浅色主题的五个色斑（位置/半径/颜色对齐 tkinter 版 THEMES.light.aurora.blobs） */
+.layer[data-t="light"] .b1 { --x: .10; --y: .06; --d: 118vmax; --c: rgba(108,130,255,.70); --dur: 27s; }
+.layer[data-t="light"] .b2 { --x: .90; --y: .04; --d: 108vmax; --c: rgba(120,215,255,.60); --dur: 31s; --delay: -4s; }
+.layer[data-t="light"] .b3 { --x: .78; --y: .90; --d: 126vmax; --c: rgba(180,140,255,.56); --dur: 35s; --delay: -9s; }
+.layer[data-t="light"] .b4 { --x: .04; --y: .94; --d: 116vmax; --c: rgba(255,160,210,.52); --dur: 29s; --delay: -14s; }
+.layer[data-t="light"] .b5 { --x: .45; --y: .46; --d: 150vmax; --c: rgba(255,255,255,.34); --dur: 41s; --delay: -20s; }
+
+.layer[data-t="dark"] .b1 { --x: .10; --y: .06; --d: 118vmax; --c: rgba(58,82,224,.62);  --dur: 27s; }
+.layer[data-t="dark"] .b2 { --x: .90; --y: .08; --d: 108vmax; --c: rgba(12,132,176,.52); --dur: 31s; --delay: -4s; }
+.layer[data-t="dark"] .b3 { --x: .78; --y: .90; --d: 126vmax; --c: rgba(124,58,208,.56); --dur: 35s; --delay: -9s; }
+.layer[data-t="dark"] .b4 { --x: .06; --y: .92; --d: 116vmax; --c: rgba(186,40,112,.42); --dur: 29s; --delay: -14s; }
+.layer[data-t="dark"] .b5 { --x: .44; --y: .44; --d: 150vmax; --c: rgba(30,40,62,.42);   --dur: 41s; --delay: -20s; }
+
+/* ── 玻璃面板 ────────────────────────────────────────────────────────────── */
+
+.glass {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-panel);
+  box-shadow:
+    0 18px 40px -22px rgba(var(--shadow-rgb), 0.55),
+    0 1px 0 0 var(--hl) inset;
+  backdrop-filter: blur(18px) saturate(150%);
+  -webkit-backdrop-filter: blur(18px) saturate(150%);
+  transition:
+    background-color var(--t-color) var(--ease),
+    border-color var(--t-color) var(--ease),
+    box-shadow var(--t-color) var(--ease);
+}
+
+/* 浏览器/显卡不支持 backdrop-filter 时退回接近不透明的底：宁可"厚"一点，也别糊成一片 */
+@supports not ((backdrop-filter: blur(2px)) or (-webkit-backdrop-filter: blur(2px))) {
+  .glass { background: var(--panel-solid); }
+  .card { background: var(--card-solid); }
+}
+
+/* ── 按钮 / 标签 / 输入 ──────────────────────────────────────────────────── */
+
+.btn {
+  appearance: none;
+  font: inherit;
+  font-size: 13px;
+  padding: 6px 13px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: var(--btn-bg);
+  color: var(--btn-fg);
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    background-color 0.16s var(--ease),
+    color var(--t-color) var(--ease),
+    border-color var(--t-color) var(--ease),
+    transform 0.1s var(--ease),
+    box-shadow 0.16s var(--ease);
+}
+
+.btn:hover:not(:disabled) { background: var(--btn-bg-on); }
+.btn:active:not(:disabled) { transform: translateY(1px) scale(0.99); }
+
+.btn.primary {
+  background: var(--accent);
+  color: #fff;
+  box-shadow: 0 6px 16px -8px var(--accent);
+}
+.btn.primary:hover:not(:disabled) { background: var(--accent-dk); }
+
+.btn.danger { background: var(--red-bg); color: var(--red); }
+.btn.danger:hover:not(:disabled) { background: var(--red-bg); border-color: var(--red); }
+
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.btn.wide { width: 100%; }
+.btn.small { font-size: 12px; padding: 4px 9px; }
+
+/* 文字链式按钮（次要操作用，避免一行塞四五个方块按钮） */
+.link {
+  appearance: none;
+  font: inherit;
+  font-size: 12.5px;
+  padding: 2px 1px;
+  border: 0;
+  background: none;
+  color: var(--accent-dk);
+  cursor: pointer;
+  white-space: nowrap;
+  border-radius: 4px;
+  transition: color var(--t-color) var(--ease), opacity 0.16s var(--ease);
+}
+.link:hover:not(:disabled) { text-decoration: underline; }
+.link.danger { color: var(--red); }
+.link.muted { color: var(--muted); }
+.link.dim { color: var(--faint); }
+.link:disabled { opacity: 0.55; cursor: not-allowed; text-decoration: none; }
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 3px 9px;
+  border-radius: 999px;
+  background: var(--gray-bg);
+  color: var(--gray);
+  white-space: nowrap;
+  transition: background-color var(--t-color) var(--ease), color var(--t-color) var(--ease);
+}
+.pill.ok { background: var(--green-bg); color: var(--green); }
+.pill.warn { background: var(--amber-bg); color: var(--amber); }
+.pill.bad { background: var(--red-bg); color: var(--red); }
+.pill.tag { font-weight: 500; font-size: 11px; padding: 1px 6px; }
+
+.input {
+  appearance: none;
+  font: inherit;
+  font-family: Consolas, "Cascadia Mono", ui-monospace, monospace;
+  font-size: 12.5px;
+  text-align: center;
+  padding: 5px 6px;
+  width: 74px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--input-bg);
+  color: var(--text);
+  transition:
+    background-color var(--t-color) var(--ease),
+    border-color 0.16s var(--ease),
+    color var(--t-color) var(--ease);
+}
+.input::placeholder { color: var(--faint); }
+.input:focus { outline: none; border-color: var(--accent); }
+
+.dot { font-size: 11px; line-height: 1; }
+.dot.ok { color: var(--green); }
+.dot.off { color: var(--gray); }
+
+/* ── 整体布局 ────────────────────────────────────────────────────────────── */
+
+.shell {
+  position: relative;
+  z-index: 1;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+}
+
+.head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: flex-start;
+  gap: 18px;
+  padding: 14px 16px;
+}
+
+.head-main { flex: 1 1 auto; min-width: 0; }
+
+.head h1 {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 19px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+}
+.head h1 small { font-size: 12px; font-weight: 400; color: var(--faint); }
+
+.head .sub {
+  margin-top: 3px;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+
+.head .remote {
+  margin-top: 5px;
+  font-size: 12.5px;
+  color: var(--muted);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 10px;
+}
+.head .remote.pending { color: var(--muted); }
+.head .remote.fail { color: var(--amber); }
+
+.head-actions {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+}
+.head-actions .row {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(430px, 3fr) minmax(330px, 2fr);
+  gap: 12px;
+}
+
+.col {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+}
+
+.col-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px 8px;
+}
+.col-head h2 { font-size: 14px; font-weight: 700; }
+.col-head .spacer { flex: 1 1 auto; }
+
+.col-cards {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 4px 12px 12px;
+  scroll-behavior: smooth;
+}
+
+.status {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 8px 14px;
+  font-size: 12.5px;
+  color: var(--muted);
+  /* 一律单行：状态栏里塞的是路径和错误详情，一旦换行整个底栏就被撑开变两行 */
+  flex-wrap: nowrap;
+  overflow: hidden;
+}
+.status .spacer { flex: 1 1 auto; }
+.status .busy { color: var(--accent); font-weight: 600; white-space: nowrap; }
+.status .counts { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* 警告药丸：文字可能很长（路径 + 系统错误原文），截断显示、全文放 title 里 */
+.status .pill {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 42%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: inline-block;
+}
+
+/* ── lane 卡片 ───────────────────────────────────────────────────────────── */
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  margin-bottom: 10px;
+  padding: 11px 13px 12px;
+  box-shadow:
+    0 14px 30px -20px rgba(var(--shadow-rgb), 0.5),
+    0 1px 0 0 var(--hl) inset;
+  backdrop-filter: blur(18px) saturate(150%);
+  -webkit-backdrop-filter: blur(18px) saturate(150%);
+  transition:
+    background-color var(--t-color) var(--ease),
+    border-color var(--t-color) var(--ease),
+    box-shadow var(--t-color) var(--ease);
+}
+
+.card.section { margin-top: 4px; }
+
+.card-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.card-title {
+  flex: 1 1 200px;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+.card-title h3 { font-size: 15px; font-weight: 700; }
+.card-title .ver { font-size: 13px; color: var(--muted); }
+
+.card-ops {
+  flex: 0 0 auto;
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;             /* 挤不下就换行 —— tkinter 版被挤扁就是因为不能换行 */
+  justify-content: flex-end;
+}
+
+.sep {
+  height: 1px;
+  background: var(--border-soft);
+  margin: 9px 0 5px;
+  transition: background-color var(--t-color) var(--ease);
+}
+
+.prof-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.prof-head .summary {
+  flex: 1 1 auto;
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  color: var(--gray);
+  text-transform: uppercase;
+}
+.prof-head .summary.has-run { color: var(--green); }
+
+.chev {
+  display: inline-block;
+  margin-left: 3px;
+  transition: transform var(--t-move) var(--ease);
+}
+.card[data-expanded="0"] .chev { transform: rotate(180deg); }
+
+/* 展开/收起：内容高度自适应，而且能过渡（tkinter 版要手工算 12 帧高度） */
+.prof-body {
+  display: grid;
+  grid-template-rows: 1fr;
+  transition: grid-template-rows var(--t-move) var(--ease);
+}
+.card[data-expanded="0"] .prof-body { grid-template-rows: 0fr; }
+.prof-inner { overflow: hidden; min-height: 0; }
+
+.prof-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 5px 0;
+}
+.prof-row + .prof-row { border-top: 1px dashed var(--border-soft); }
+
+.prof-info {
+  flex: 1 1 220px;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.prof-info .name { font-size: 13.5px; font-weight: 700; }
+.prof-info .meta { font-size: 12px; color: var(--muted); }
+.prof-info .tags { font-size: 11px; color: var(--gray); }
+.prof-info .url {
+  flex-basis: 100%;
+  font-family: Consolas, "Cascadia Mono", ui-monospace, monospace;
+  font-size: 11px;
+  color: var(--accent);
+  cursor: pointer;
+  overflow-wrap: anywhere;
+  padding-left: 14px;
+}
+.prof-info .url:hover { color: var(--accent-dk); text-decoration: underline; }
+
+.prof-ops {
+  flex: 0 0 auto;
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.prof-note {
+  font-size: 11px;
+  color: var(--gray);
+  padding: 2px 0 4px;
+}
+
+.card-foot { display: flex; flex-direction: column; gap: 5px; }
+.card-foot .row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+.card-foot .row .right { margin-left: auto; }
+.card-foot .note { font-size: 11px; color: var(--faint); }
+
+.empty {
+  padding: 16px 14px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  backdrop-filter: blur(18px) saturate(150%);
+  -webkit-backdrop-filter: blur(18px) saturate(150%);
+}
+.empty h3 { font-size: 15px; margin-bottom: 6px; }
+.empty p { font-size: 12.5px; color: var(--muted); white-space: pre-line; }
+.empty.nojs { margin: 24px; }
+
+.list-section {
+  margin: 14px 2px 8px;
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  color: var(--faint);
+  text-transform: uppercase;
+}
+
+.install-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 4px 0;
+}
+.install-row + .install-row { border-top: 1px dashed var(--border-soft); }
+.install-row .who { flex: 1 1 240px; min-width: 0; }
+.install-row .who .line1 { font-size: 12.5px; color: var(--muted); }
+.install-row .who .line2 {
+  font-family: Consolas, "Cascadia Mono", ui-monospace, monospace;
+  font-size: 11px;
+  color: var(--faint);
+  overflow-wrap: anywhere;
+}
+
+/* ── 日志面板 ─────────────────────────────────────────────────────────────
+   故意不挂 backdrop-filter：滚动时每帧重新模糊一大片文本太贵。
+   底色接近不透明，视觉上依旧是"嵌在玻璃里的一块深色板"。 */
+
+.log-wrap {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  overflow: hidden;
+  padding: 0;
+}
+
+#log {
+  flex: 1 1 auto;
+  margin: 0;
+  padding: 10px 12px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: Consolas, "Cascadia Mono", ui-monospace, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text);
+  background: var(--log-bg);
+  border-radius: calc(var(--radius-panel) - 1px);
+  transition: background-color var(--t-color) var(--ease), color var(--t-color) var(--ease);
+}
+
+#log .ln { display: block; }
+#log .t-head { color: var(--accent); font-weight: 700; }
+#log .t-ok { color: var(--green); }
+#log .t-err { color: var(--red); }
+#log .t-warn { color: var(--amber); }
+#log .t-muted { color: var(--muted); }
+
+.jump {
+  position: absolute;
+  right: 16px;
+  bottom: 12px;
+  box-shadow: 0 10px 24px -12px rgba(var(--shadow-rgb), 0.8);
+}
+
+.log-empty { color: var(--faint); }
+
+/* ── 对话框 ──────────────────────────────────────────────────────────────── */
+
+dialog.modal {
+  width: min(560px, calc(100vw - 40px));
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-panel);
+  background: var(--panel-solid);
+  color: var(--text);
+  box-shadow: 0 30px 70px -30px rgba(var(--shadow-rgb), 0.9);
+  opacity: 0;
+  transform: translateY(10px) scale(0.985);
+  transition: opacity 0.2s var(--ease), transform 0.2s var(--ease),
+              overlay 0.2s var(--ease) allow-discrete,
+              display 0.2s var(--ease) allow-discrete;
+}
+dialog.modal[open] { opacity: 1; transform: none; }
+
+@starting-style {
+  dialog.modal[open] { opacity: 0; transform: translateY(10px) scale(0.985); }
+}
+
+dialog.modal::backdrop {
+  background: rgba(6, 9, 16, 0.42);
+  backdrop-filter: blur(3px);
+  -webkit-backdrop-filter: blur(3px);
+  opacity: 0;
+  transition: opacity 0.2s var(--ease),
+              overlay 0.2s var(--ease) allow-discrete,
+              display 0.2s var(--ease) allow-discrete;
+}
+dialog.modal[open]::backdrop { opacity: 1; }
+
+@starting-style {
+  dialog.modal[open]::backdrop { opacity: 0; }
+}
+
+.modal-head {
+  padding: 15px 18px 0;
+  font-size: 15px;
+  font-weight: 700;
+}
+.modal-body {
+  padding: 10px 18px 4px;
+  font-size: 12.5px;
+  color: var(--muted);
+  max-height: min(56vh, 460px);
+  overflow: auto;
+}
+.modal-body .kv {
+  display: grid;
+  grid-template-columns: 84px 1fr;
+  gap: 3px 10px;
+  margin-bottom: 8px;
+}
+.modal-body .kv dt { color: var(--faint); }
+.modal-body .kv dd {
+  margin: 0;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+.modal-body .warn { color: var(--amber); }
+/* 说明文字里带 \n 的一律按换行显示：这些框里写的是"会做什么"的清单，
+   塌成一行后读起来就完全不是那个意思了 */
+.modal-body p { white-space: pre-line; }
+.modal-body input[type="text"] {
+  font: inherit;
+  font-family: Consolas, "Cascadia Mono", ui-monospace, monospace;
+  padding: 6px 8px;
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--input-bg);
+  color: var(--text);
+}
+.modal-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 14px 18px 16px;
+}
+
+/* ── 第二批：表单窗口（openDialog 建出来的那些） ──────────────────────────
+   和上面 #modal 那个"确认/取消"框共用 dialog.modal 的外观，只是：尺寸分档、
+   正文能装表单与清单、底部按钮由 openDialog 动态摆。 */
+
+dialog.modal.dlg { width: min(640px, calc(100vw - 40px)); }
+dialog.modal.dlg[data-size="lg"] { width: min(880px, calc(100vw - 40px)); }
+dialog.modal.dlg[data-size="xl"] { width: min(1100px, calc(100vw - 40px)); }
+dialog.modal.dlg .modal-body { max-height: min(74vh, 740px); }
+dialog.modal.dlg .modal-body { padding-top: 12px; }
+dialog.modal.dlg .modal-foot { flex-wrap: wrap; }
+
+.dlg-load {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 14px 2px;
+  color: var(--muted);
+}
+.spinner.small {
+  width: 15px;
+  height: 15px;
+  border-width: 2px;
+  flex: 0 0 auto;
+}
+
+.dlg-lead {
+  color: var(--muted);
+  margin-bottom: 6px;
+  line-height: 1.6;
+}
+.dlg-lead.warn { color: var(--amber); }
+.dlg-lead.ok { color: var(--green); }
+.dlg-lead.dim { color: var(--faint); }
+.dlg-note {
+  font-size: 11.5px;
+  color: var(--faint);
+  line-height: 1.6;
+  margin-bottom: 8px;
+}
+.dlg-note.info {
+  padding: 7px 10px;
+  border-radius: 8px;
+  background: var(--accent-soft);
+  color: var(--accent-dk);
+}
+.dlg-note.warn {
+  padding: 7px 10px;
+  border-radius: 8px;
+  background: var(--amber-bg);
+  color: var(--amber);
+}
+.dlg-note.err { color: var(--red); }
+
+/* 表单 */
+.form { display: flex; flex-direction: column; gap: 10px; margin: 10px 0; }
+.field { display: flex; flex-direction: column; gap: 4px; }
+.field-label {
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  color: var(--muted);
+}
+.field-note {
+  font-size: 11px;
+  color: var(--faint);
+  line-height: 1.55;
+}
+.field-note.warn { color: var(--amber); }
+.field-note.ok { color: var(--green); }
+.field-note.err { color: var(--red); }
+
+.text-input,
+.select {
+  appearance: none;
+  font: inherit;
+  font-family: Consolas, "Cascadia Mono", ui-monospace, monospace;
+  font-size: 12.5px;
+  padding: 6px 8px;
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--input-bg);
+  color: var(--text);
+  transition: border-color 0.16s var(--ease), background-color var(--t-color) var(--ease);
+}
+.text-input::placeholder { color: var(--faint); }
+.text-input:focus,
+.select:focus { outline: none; border-color: var(--accent); }
+.select { font-family: inherit; }
+
+/* 可手输的下拉（input + datalist）：Lane 用 select，profile 名要允许现场起新的 */
+.combo { display: inline-flex; }
+.combo .text-input { min-width: 118px; }
+
+/* 单选 / 复选：用 appearance:none 自绘，免得靠浏览器默认样式在深色主题下变成白块 */
+.radio-row,
+.check {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  font-size: 12px;
+  color: var(--text);
+  cursor: pointer;
+  line-height: 1.5;
+  padding: 2px 0;
+}
+.radio-row input,
+.check input {
+  appearance: none;
+  flex: 0 0 auto;
+  width: 15px;
+  height: 15px;
+  margin: 1px 0 0;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--input-bg);
+  cursor: pointer;
+  position: relative;
+  transition: background-color 0.16s var(--ease), border-color 0.16s var(--ease);
+}
+.radio-row input { border-radius: 50%; }
+.radio-row input:checked,
+.check input:checked { background: var(--accent); border-color: var(--accent); }
+.radio-row input:checked::after,
+.check input:checked::after {
+  content: "";
+  position: absolute;
+  border-radius: 50%;
+  background: #fff;
+}
+.radio-row input:checked::after { inset: 4px; }
+.check input:checked::after {
+  left: 4px;
+  top: 1px;
+  width: 5px;
+  height: 9px;
+  border-radius: 0;
+  background: none;
+  border: solid #fff;
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+.radio-row input:disabled,
+.check input:disabled { opacity: 0.45; cursor: not-allowed; }
+.radio-row:has(input:disabled),
+.check:has(input:disabled) { opacity: 0.6; cursor: not-allowed; }
+.check.tiny { font-size: 11.5px; color: var(--muted); }
+
+.radio-group,
+.check-group { display: flex; flex-direction: column; gap: 3px; }
+.check-group.row2 { flex-direction: row; flex-wrap: wrap; gap: 4px 18px; }
+
+/* 版本 / 候选清单 */
+.opt-list {
+  max-height: 30vh;
+  min-height: 96px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--input-bg);
+  margin-top: 4px;
+}
+.opt-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  cursor: pointer;
+  font-family: Consolas, "Cascadia Mono", ui-monospace, monospace;
+  font-size: 12px;
+  color: var(--text);
+  border-bottom: 1px solid var(--border-soft);
+}
+.opt-row:last-child { border-bottom: 0; }
+.opt-row:hover { background: var(--btn-bg); }
+.opt-row[aria-selected="true"] { background: var(--accent-soft); color: var(--accent-dk); }
+.opt-row .tag { font-size: 11px; color: var(--muted); }
+.opt-row .mark { font-size: 11px; color: var(--faint); margin-left: auto; white-space: nowrap; }
+.opt-empty { padding: 10px; font-size: 12px; color: var(--faint); }
+
+/* 勾选清单（插件 / 凭据条目）。给个最小高度：空清单只有一行字的时候，
+   一条 27px 的细条看起来像"坏了"，而不像"这里还没有东西"。 */
+.pick-list {
+  max-height: 40vh;
+  min-height: 132px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--input-bg);
+  padding: 4px 8px;
+}
+.pick-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 5px 2px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.pick-row:last-child { border-bottom: 0; }
+.pick-row .pick-main { flex: 1 1 auto; min-width: 0; }
+.pick-row .pick-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.pick-row .pick-title b { font-size: 12.5px; }
+.pick-row .pick-title .ver {
+  font-family: Consolas, "Cascadia Mono", ui-monospace, monospace;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+.pick-row .pick-sub {
+  font-size: 11px;
+  color: var(--faint);
+  overflow-wrap: anywhere;
+  font-family: Consolas, "Cascadia Mono", ui-monospace, monospace;
+}
+.pick-row .pick-note { font-size: 11px; color: var(--faint); }
+.pick-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin: 8px 0 2px;
+}
+.pick-bar .spacer { flex: 1 1 auto; }
+
+/* 计划预览 */
+.preview {
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--input-bg);
+  font-family: Consolas, "Cascadia Mono", ui-monospace, monospace;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--text);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 26vh;
+  overflow: auto;
+}
+.preview .ok { color: var(--green); }
+.preview .err { color: var(--red); }
+.preview .warn { color: var(--amber); }
+.preview .muted { color: var(--muted); }
+
+/* 插件库：左清单 / 右目标＋计划 */
+.plug-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+  gap: 14px;
+  align-items: start;
+}
+.plug-col { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.plug-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.plug-head .select { width: auto; min-width: 92px; }
+.two-col {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr);
+  gap: 8px 10px;
+  align-items: center;
+  margin: 8px 0;
+  font-size: 12px;
+}
+.two-col > .k { color: var(--faint); }
+
+/* 清单表格（备份对话） */
+.rows {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--input-bg);
+  max-height: 34vh;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.row-head,
+.rows .row-item {
+  display: grid;
+  gap: 10px;
+  padding: 5px 10px;
+  align-items: center;
+  font-size: 12px;
+}
+.row-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--btn-bg);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+.rows .row-item {
+  cursor: pointer;
+  border-top: 1px solid var(--border-soft);
+  color: var(--text);
+}
+.rows .row-item:hover { background: var(--btn-bg); }
+.rows .row-item[aria-selected="true"] { background: var(--accent-soft); color: var(--accent-dk); }
+.rows .row-item.bad { color: var(--amber); }
+.rows .mono-cell {
+  font-family: Consolas, "Cascadia Mono", ui-monospace, monospace;
+  font-size: 11.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 时间列给足 152px：19 个字符的时间戳在窄列里会被省略号截掉（第一版就是 118px，看着像数据没了） */
+.cols-chat { grid-template-columns: minmax(0, 1.4fr) 152px 44px 64px minmax(0, 1fr); }
+
+/* 配置备份列表 / 包内插件列表 */
+.cols-cfg { grid-template-columns: minmax(0, 2.1fr) 150px 92px 48px 56px 78px; }
+.cols-cfg-plugin {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) 110px 52px 78px;
+  gap: 8px;
+  padding: 3px 10px;
+  align-items: center;
+  font-size: 12px;
+  border-top: 1px solid var(--border-soft);
+}
+.cols-cfg-plugin:first-child { border-top: 0; }
+.cfg-plugin-rows {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--input-bg);
+  margin: 4px 0 12px;
+  max-height: 260px;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.cfg-plugin-rows .row-item { cursor: default; }
+.cfg-plugin-rows .row-item:hover { background: var(--hover, rgba(127,127,127,0.07)); }
+.cfg-prof h4 { margin: 10px 0 2px; font-size: 12.5px; }
+.cfg-mode { display: flex; align-items: center; gap: 12px; margin: 8px 0; }
+.cfg-mode .check { flex: 0 0 auto; }
+.cfg-mode .two-col { flex: 1 1 auto; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.check-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 2px 16px;
+  margin: 4px 0;
+  max-height: 160px;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.cols-del {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: 8px;
+  padding: 4px 10px;
+  align-items: start;
+  font-size: 12px;
+  border-top: 1px solid var(--border-soft);
+}
+.cols-del:first-child { border-top: 0; }
+.cols-del .path {
+  font-family: Consolas, "Cascadia Mono", ui-monospace, monospace;
+  font-size: 11px;
+  color: var(--faint);
+  overflow-wrap: anywhere;
+}
+.cols-del .why { font-size: 11px; color: var(--faint); }
+.cols-del .why.bad { color: var(--red); }
+.cols-del.spot { padding-left: 30px; }
+.cols-del.spot .path { color: var(--faint); }
+
+.danger-zone {
+  margin: 10px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--red);
+  border-radius: 9px;
+  background: var(--red-bg);
+  color: var(--red);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.danger-zone b { font-weight: 700; }
+
+/* 按钮行（对话框正文里的次要操作） */
+.btn-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 6px 0;
+}
+.btn-row .spacer { flex: 1 1 auto; }
+
+/* 窄窗口：插件库那种两栏在 720px 以下堆叠 */
+@media (max-width: 760px) {
+  .plug-grid { grid-template-columns: 1fr; }
+  .cols-chat { grid-template-columns: minmax(0, 1.4fr) 100px 46px 62px; }
+  .cols-chat .hide-narrow { display: none; }
+}
+
+/* ── 吐司提示 ────────────────────────────────────────────────────────────── */
+
+/* 这是个 popover="manual"：#toasts 要待在 top layer 里 —— 对话框（<dialog> 的
+   showModal）也在 top layer，不在这一层的元素会被它的 ::backdrop 压住，
+   窗口里报的错就"看不见"了。inset/margin 那几行是用来中和 popover 的 UA 样式的。 */
+.toasts {
+  position: fixed;
+  inset: auto auto 58px 50%;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  overflow: visible;
+  width: auto;
+  height: auto;
+  z-index: 40;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.toast {
+  padding: 7px 15px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--panel-solid);
+  color: var(--text);
+  font-size: 12.5px;
+  box-shadow: 0 16px 34px -18px rgba(var(--shadow-rgb), 0.9);
+  animation: toast-in 0.22s var(--ease);
+}
+.toast.err { border-color: var(--red); color: var(--red); }
+.toast.ok { border-color: var(--green); color: var(--green); }
+.toast.out { animation: toast-out 0.22s var(--ease) forwards; }
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(8px) scale(0.96); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes toast-out {
+  to { opacity: 0; transform: translateY(6px) scale(0.97); }
+}
+
+/* ── 连接中 / 断线的整体遮罩 ─────────────────────────────────────────────── */
+
+.boot {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  font-size: 13px;
+  color: var(--muted);
+  background: var(--bg);
+  transition: opacity 0.3s var(--ease), visibility 0.3s;
+}
+.boot[hidden] { display: none; }
+.boot.gone { opacity: 0; visibility: hidden; pointer-events: none; }
+
+.spinner {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  animation: spin 0.9s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.boot .boot-hint { font-size: 12px; color: var(--faint); }
+
+/* ── 骨架屏（首屏状态还没到） ────────────────────────────────────────────── */
+
+.skel {
+  height: 96px;
+  margin-bottom: 10px;
+  border-radius: var(--radius-card);
+  border: 1px solid var(--border-soft);
+  background: linear-gradient(100deg, var(--card) 30%, var(--border-soft) 50%, var(--card) 70%);
+  background-size: 300% 100%;
+  animation: shimmer 1.4s linear infinite;
+}
+@keyframes shimmer {
+  from { background-position: 120% 0; }
+  to { background-position: -20% 0; }
+}
+
+/* ── 帧率表（?debug=1） ──────────────────────────────────────────────────── */
+
+.fps {
+  position: fixed;
+  right: 14px;
+  bottom: 56px;
+  z-index: 35;
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--panel-solid);
+  font-family: Consolas, "Cascadia Mono", ui-monospace, monospace;
+  font-size: 11.5px;
+  color: var(--muted);
+  box-shadow: 0 12px 26px -16px rgba(var(--shadow-rgb), 0.9);
+  text-align: right;
+  line-height: 1.5;
+}
+.fps b { color: var(--green); font-size: 13px; }
+.fps.warn b { color: var(--amber); }
+.fps .fps-note { color: var(--faint); font-size: 10.5px; }
+
+/* ── 滚动条 ──────────────────────────────────────────────────────────────── */
+
+::-webkit-scrollbar { width: 11px; height: 11px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--muted) 34%, transparent);
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--muted) 55%, transparent);
+  background-clip: content-box;
+}
+::-webkit-scrollbar-corner { background: transparent; }
+
+/* ── 窄窗口 ──────────────────────────────────────────────────────────────
+   断点定在 860px 而不是更宽：tkinter 版的最小窗口是 960×620 且左右两栏并排
+   （左栏至少 440 + 右边至少 340），这里保持一致 —— 到 860 以下才上下堆叠。 */
+
+@media (max-width: 860px) {
+  .body { grid-template-columns: 1fr; grid-template-rows: minmax(0, 1.35fr) minmax(0, 1fr); }
+  .head { flex-wrap: wrap; }
+  .head-actions { align-items: flex-start; width: 100%; }
+  .head-actions .row { justify-content: flex-start; }
+}
+
+/* ── 尊重"减少动态效果" ──────────────────────────────────────────────────── */
+
+@media (prefers-reduced-motion: reduce) {
+  .blob { animation: none; }
+  .skel { animation: none; }
+  .spinner { animation-duration: 2.4s; }
+  * { transition-duration: 0.01ms !important; }
+}

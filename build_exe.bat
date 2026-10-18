@@ -5,7 +5,8 @@ rem  Pure ASCII + CRLF on purpose: avoids cmd.exe encoding issues.
 rem
 rem  Output (in dist\):
 rem    dist\dsh-lanes\dsh-lanes.exe            CLI   (console)
-rem    dist\dsh-lanes-gui\dsh-lanes-gui.exe    GUI   (windowed)
+rem    dist\dsh-lanes-gui\dsh-lanes-gui.exe    GUI   (windowed, classic tkinter)
+rem    dist\dsh-lanes-web\dsh-lanes-web.exe    GUI   (windowed, new Web frontend)
 rem
 rem  IMPORTANT - this builds --onedir, NOT --onefile:
 rem  --onefile unpacks itself into %TEMP% on every start. On this machine
@@ -17,6 +18,11 @@ rem
 rem  When sharing: zip the WHOLE folder, do not copy the .exe alone -
 rem  the .exe needs the DLLs and the _internal folder next to it.
 rem
+rem  The web build needs the web\ folder bundled (--add-data "web;web"):
+rem  frozen Python looks for the UI files under sys._MEIPASS, and without
+rem  them the launcher says "interface files not found" instead of showing
+rem  an empty window.
+rem
 rem  Needs PyInstaller (once):  py -m pip install pyinstaller
 rem ============================================================
 setlocal
@@ -27,7 +33,7 @@ if %errorlevel%==0 (set PY=py) else (set PY=python)
 
 rem A running exe locks its own folder (dist\...\_internal\*.dll), and the build
 rem then dies halfway with "PermissionError: ... libcrypto-3.dll". Fail early instead.
-for %%E in (dsh-lanes.exe dsh-lanes-gui.exe) do (
+for %%E in (dsh-lanes.exe dsh-lanes-gui.exe dsh-lanes-web.exe) do (
     tasklist /fi "imagename eq %%E" 2>nul | find /i "%%E" >nul
     if not errorlevel 1 (
         echo [XX] %%E is still running - close that window first, then run this again.
@@ -45,18 +51,23 @@ if not %errorlevel%==0 (
     exit /b 1
 )
 
-echo === [1/2] building CLI: dist\dsh-lanes\dsh-lanes.exe ===
+echo === [1/3] building CLI: dist\dsh-lanes\dsh-lanes.exe ===
 %PY% -m PyInstaller --noconfirm --clean --onedir --console --name dsh-lanes dsh_lanes.py
 if not %errorlevel%==0 goto fail
 
-echo === [2/2] building GUI: dist\dsh-lanes-gui\dsh-lanes-gui.exe ===
+echo === [2/3] building GUI (classic): dist\dsh-lanes-gui\dsh-lanes-gui.exe ===
 %PY% -m PyInstaller --noconfirm --clean --onedir --windowed --name dsh-lanes-gui dsh_lanes_gui.py
+if not %errorlevel%==0 goto fail
+
+echo === [3/3] building GUI (web): dist\dsh-lanes-web\dsh-lanes-web.exe ===
+%PY% -m PyInstaller --noconfirm --clean --onedir --windowed --name dsh-lanes-web --add-data "web;web" dsh_lanes_web.py
 if not %errorlevel%==0 goto fail
 
 echo.
 echo [OK] build finished. Run these:
 echo      dist\dsh-lanes\dsh-lanes.exe doctor
-echo      dist\dsh-lanes-gui\dsh-lanes-gui.exe
+echo      dist\dsh-lanes-web\dsh-lanes-web.exe      (new Web frontend)
+echo      dist\dsh-lanes-gui\dsh-lanes-gui.exe      (classic tkinter window)
 echo.
 echo Reminder: unsigned exe - SmartScreen may ask for confirmation
 echo on first run ("More info" -^> "Run anyway").
