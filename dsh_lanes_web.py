@@ -62,7 +62,7 @@ if str(HERE) not in sys.path:
 
 import dsh_lanes as core  # noqa: E402
 
-BUILD = "web-0.6.2"
+BUILD = "web-0.6.3"
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 MAX_LOG_LINES = 4000          # 服务器侧日志环形缓冲（与旧界面 _MAX_LOG_LINES 对齐）

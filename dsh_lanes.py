@@ -451,7 +451,8 @@ def pid_alive(pid: int) -> bool:
 
 def kill_tree(pid: int) -> None:
     if os.name == "nt":
-        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                       capture_output=True, creationflags=_no_window_flags())
     else:
         try:
             os.kill(pid, 15)
@@ -1420,8 +1421,22 @@ def resolve_tag(packument: dict, spec: str) -> str:
 # ======================= 子进程：无管道执行（写日志 + 可选跟随） =======================
 
 
+def _no_window_flags() -> int:
+    """短命令（npm/pnpm/node/taskkill 等）：不弹控制台窗口。
+
+    关键：start_gui.bat 用 pythonw（无控制台）启动后端，此时控制台子进程默认会
+    新开一个 conhost 黑窗、一闪而过——装插件、跑 node 时就看到 node 窗口不停闪。
+    CREATE_NO_WINDOW 让子进程不分配控制台（输出仍可走我们重定向的文件/管道）。
+    """
+    return getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if os.name == "nt" else 0
+
+
 def _new_group_flags() -> int:
-    return subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+    """长驻服务（dsh web）：独立进程组（方便整组 kill_tree）+ 同样不弹控制台窗口。"""
+    flags = _no_window_flags()
+    if os.name == "nt":
+        flags |= subprocess.CREATE_NEW_PROCESS_GROUP
+    return flags
 
 
 def follow_file(path: Path, stop: threading.Event, on_line=None, start_offset: int = 0) -> threading.Thread:
@@ -1444,21 +1459,23 @@ def follow_file(path: Path, stop: threading.Event, on_line=None, start_offset: i
                 fh.seek(start_offset)
             except OSError:
                 pass
+            def emit(piece: str) -> None:
+                # on_line 返回 True 表示"这行我自己处理了，别再原样打印"
+                # （用于把 npm 几百行 http 日志压成几行下载进度）。
+                if on_line and on_line(piece):
+                    return
+                sys.stdout.write(piece)
+                sys.stdout.flush()
+
             while True:
                 line = fh.readline()
                 if line:
-                    sys.stdout.write(line)
-                    sys.stdout.flush()
-                    if on_line:
-                        on_line(line)
+                    emit(line)
                     continue
                 if stop.is_set():
                     rest = fh.read()
                     if rest:
-                        sys.stdout.write(rest)
-                        sys.stdout.flush()
-                        if on_line:
-                            on_line(rest)
+                        emit(rest)
                     return
                 time.sleep(0.15)
 
@@ -1467,8 +1484,13 @@ def follow_file(path: Path, stop: threading.Event, on_line=None, start_offset: i
     return t
 
 
-def run_logged(cmd: list[str], cwd: Path, env: dict, log_path: Path, follow: bool = True) -> int:
-    """执行命令：stdout/stderr 直接落到日志文件（不用管道），可选实时跟随打印。"""
+def run_logged(cmd: list[str], cwd: Path, env: dict, log_path: Path, follow: bool = True,
+               on_line=None) -> int:
+    """执行命令：stdout/stderr 直接落到日志文件（不用管道），可选实时跟随打印。
+
+    on_line(line)：跟随线程每行回调；返回 True 表示这行由回调自行处理、不再原样打印
+    （用于把 npm 冗长的 http 日志压缩成下载进度）。
+    """
     log_path.parent.mkdir(parents=True, exist_ok=True)
     stop = threading.Event()
     thread = None
@@ -1477,7 +1499,7 @@ def run_logged(cmd: list[str], cwd: Path, env: dict, log_path: Path, follow: boo
         logf.flush()
         offset = logf.tell()
         if follow:
-            thread = follow_file(log_path, stop, start_offset=offset)
+            thread = follow_file(log_path, stop, on_line=on_line, start_offset=offset)
         proc = subprocess.Popen(
             cmd,
             cwd=str(cwd),
@@ -1495,6 +1517,45 @@ def run_logged(cmd: list[str], cwd: Path, env: dict, log_path: Path, follow: boo
 
 
 # ======================= npm 安装 =======================
+
+
+_NPM_HTTP_RE = re.compile(r"\bhttp\s+fetch\b", re.IGNORECASE)
+_NPM_TGZ_RE = re.compile(r"/-/(?P<pkg>[^/\s)]+?\.tgz)")
+
+
+def _npm_progress_reporter(prefix: str = "      "):
+    """把 npm `--loglevel=http` 的逐包下载日志压成"已下载 N 个包（速率）"。
+
+    原始 http 行仍完整写进日志文件（方便排查），只是不原样刷到界面；非 http 行
+    （npm warn / deprecated / error / 最后的 added N packages / 阶段信息）照常透传。
+    npm 在非 TTY（输出重定向给文件）时不画进度条，这是能看到"在下载、没卡死"的办法。
+    """
+    state = {"n": 0, "last_t": time.monotonic(), "start": time.monotonic()}
+    lock = threading.Lock()
+
+    def on_line(line: str) -> bool:
+        s = line.rstrip()
+        if not _NPM_HTTP_RE.search(s):
+            return False  # 非 http 行：原样透传（警告/错误/阶段/汇总）
+        m = _NPM_TGZ_RE.search(s)
+        if not m:
+            return True  # metadata 请求之类的 http 行：太吵，吞掉
+        with lock:
+            state["n"] += 1
+            n = state["n"]
+            now = time.monotonic()
+            pkg = m.group("pkg")
+            if len(pkg) > 48:
+                pkg = pkg[:45] + "..."
+            if n == 1:
+                info(col(f"{prefix}⬇ 开始下载依赖包（首个：{pkg}）…", C.GRAY))
+            elif n % 20 == 0 or now - state["last_t"] >= 1.5:
+                state["last_t"] = now
+                rate = n / max(now - state["start"], 0.001)
+                info(col(f"{prefix}⬇ 已下载 {n} 个包（约 {rate:.1f} 包/秒，最近：{pkg}）", C.GRAY))
+        return True
+
+    return on_line
 
 
 def build_npm_env(cfg: dict, node: str) -> dict:
@@ -1572,13 +1633,19 @@ def npm_install_tree(cfg: dict, tree: Path, version: str, log_path: Path,
             reg,
             "--no-audit",
             "--no-fund",
-            "--loglevel=notice",
+            # http 级别才会逐包打印 fetch（非 TTY 下 npm 不画进度条）；
+            # 原始行写进日志，界面端由 _npm_progress_reporter 压成"已下载 N 个包"。
+            "--loglevel=http",
         ]
         info(col(f"正在{what} {PKG}@{version} → {tree}", C.BOLD))
         info(f"  下载源    : {registry_label(reg)}"
              + ("（首选）" if index == 0 else "（换源重试）"))
-        info(col(f"（日志：{log_path}）", C.GRAY))
-        code = run_logged(cmd, cwd=tree, env=env, log_path=log_path, follow=follow)
+        if index == 0:
+            info(col("  正在从 registry 下载并解包依赖（数百个包，首装约 1–3 分钟），"
+                     "下面实时显示下载进度：", C.GRAY))
+        info(col(f"（完整日志：{log_path}）", C.GRAY))
+        code = run_logged(cmd, cwd=tree, env=env, log_path=log_path, follow=follow,
+                          on_line=_npm_progress_reporter() if follow else None)
         got = installed_version(tree)
         if code == 0 and got == version:
             return reg
@@ -1909,7 +1976,8 @@ def cmd_doctor(cfg: dict, args) -> int:
     info(f"  node        : {node or '未找到'}")
     if node:
         try:
-            out = subprocess.run([node, "-v"], capture_output=True, text=True, timeout=20).stdout.strip()
+            out = subprocess.run([node, "-v"], capture_output=True, text=True, timeout=20,
+                                 creationflags=_no_window_flags()).stdout.strip()
             ok(f"node 可执行（{out}）")
         except Exception as exc:
             fail(f"node 无法执行：{exc}")
@@ -1918,7 +1986,8 @@ def cmd_doctor(cfg: dict, args) -> int:
     if node and npm_cli:
         try:
             out = subprocess.run(
-                [node, npm_cli, "-v"], capture_output=True, text=True, timeout=30
+                [node, npm_cli, "-v"], capture_output=True, text=True, timeout=30,
+                creationflags=_no_window_flags(),
             ).stdout.strip()
             ok(f"npm 可执行（{out}）")
         except Exception as exc:
@@ -4183,6 +4252,7 @@ def run_dump_config(cfg: dict, lane: str, profile: str = PROFILE_NAME, timeout: 
                 env=env,
                 timeout=timeout,
                 cwd=str(cfg.get("default_cwd") or home),
+                creationflags=_no_window_flags(),
             ).returncode
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "rc": -1, "error": f"{type(exc).__name__}: {exc}", "rows": {}, "unmatched": [], "skipped": []}
@@ -4514,6 +4584,7 @@ def judge_patch_yaml(cfg: dict, home, pkg_dir, path: Path, install_dir=None) -> 
             [node, "-e", YAML_JUDGE_JS],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=120, env=env,
+            creationflags=_no_window_flags(),
         )
         payload = ""
         for line in reversed((proc.stdout or "").splitlines()):
@@ -6826,7 +6897,8 @@ def run_plugin_cmd(cfg: dict, lane: str, pnpm_args: list[str], timeout: int = 12
     try:
         with open(log_p, "w", encoding="utf-8") as fo, open(err_p, "w", encoding="utf-8") as fe:
             rc = subprocess.run(cmd, stdout=fo, stderr=fe, env=env, timeout=timeout,
-                                cwd=str(profile_dir(home, profile))).returncode
+                                cwd=str(profile_dir(home, profile)),
+                                creationflags=_no_window_flags()).returncode
     except subprocess.TimeoutExpired:
         rc, error = -2, f"超过 {timeout} 秒还没结束（已终止）"
     except Exception as exc:  # noqa: BLE001
@@ -6834,6 +6906,42 @@ def run_plugin_cmd(cfg: dict, lane: str, pnpm_args: list[str], timeout: int = 12
     tail = [line for line in (tail_lines(log_p, 14) + tail_lines(err_p, 14)) if line.strip()]
     return {"ok": rc == 0, "rc": rc, "log": log_p, "err_log": err_p, "tail": tail[-14:],
             "error": error, "seconds": round(time.time() - started, 1), "repairs": repairs}
+
+
+def plugin_add_smart(cfg: dict, lane: str, profile: str, spec: str,
+                     label: str = "cfg-restore", timeout: int = 1200,
+                     non_registry: bool = False) -> dict:
+    """装一个插件，能离线就不联网（配置迁移/本机重装时复用已下载内容）。
+
+    · registry 包（pkg@version）：先 `--offline` 纯离线。pnpm 同盘共享一个内容寻址
+      store（默认 D:\\.pnpm-store\\v11）——这台机器上别的 lane 装过**完全相同版本**，
+      store 里就有，按内容哈希天然保证版本一致，直接硬链接、零网络。本地缺包
+      （NO_OFFLINE_META / 无匹配版本）再退回 `--prefer-offline` 联网：本地有的不重下，
+      只补缺的。
+    · git/github/http 等非 registry 包（non_registry=True）：源码仍要联网拉，
+      但依赖走 `--prefer-offline`，能复用 store 的就不重复下载。
+    · file:/link: 本地包请直接用 run_plugin_cmd，不走这里。
+
+    返回 run_plugin_cmd 的结果，并额外带 mode = "offline" | "online" | "failed"。
+    """
+    args = ["add", spec, "--save-exact"]
+    if non_registry:
+        res = run_plugin_cmd(cfg, lane, args + ["--prefer-offline"],
+                             label=label, profile=profile, timeout=timeout)
+        res["mode"] = "online" if res.get("ok") else "failed"
+        return res
+    # 1) 先纯离线
+    res = run_plugin_cmd(cfg, lane, args + ["--offline"],
+                         label=label, profile=profile, timeout=timeout)
+    if res.get("ok"):
+        res["mode"] = "offline"
+        return res
+    # 2) 本地缺包 → 联网补（仍优先本地缓存）
+    res2 = run_plugin_cmd(cfg, lane, args + ["--prefer-offline"],
+                          label=label, profile=profile, timeout=timeout)
+    res2["mode"] = "online" if res2.get("ok") else "failed"
+    res2["offline_tail"] = res.get("tail")
+    return res2
 
 
 def market_snapshot(cfg: dict, lane: str, label: str = "", note: str = "",
@@ -8274,22 +8382,39 @@ def cfg_restore(cfg: dict, zip_path: Path, target: str = "", new_lane: str = "",
                     report["skipped"].append((f"{pname}/{pkg}", "宿主自带"))
                     continue
                 src_spec = plug.get("spec") or ""
-                if str(src_spec).lower().startswith(("file:", "link:")):
+                is_local = str(src_spec).lower().startswith(("file:", "link:"))
+                is_nonreg = (not is_local) and bool(NON_REGISTRY_SPEC_RE.match(src_spec))
+                if is_local:
+                    # 本地 file:/link: 插件：已在第 3 步还原到目标 lane，直接按本地路径装
                     want = spec_map.get(pkg)
                     if not want:
                         report["failed"].append((f"{pname}/{pkg}",
                                                  f"本地插件未包含在备份中：{src_spec}"))
                         continue
-                elif NON_REGISTRY_SPEC_RE.match(src_spec):
-                    want = src_spec
+                    ok(f"  {pname}: 还原本地插件 {pkg}（{want}）")
+                    res = run_plugin_cmd(cfg, lane, ["add", want, "--save-exact"],
+                                         label="cfg-restore", profile=pname, timeout=timeout)
+                    mode = "local"
                 else:
-                    want = plug.get("version") or src_spec
-                ok(f"  {pname}: 安装 {pkg} @ {want}")
-                res = run_plugin_cmd(cfg, lane, ["add", f"{pkg}@{want}", "--save-exact"],
-                                     label="cfg-restore", profile=pname, timeout=timeout)
+                    if is_nonreg:
+                        spec = src_spec
+                        what = src_spec
+                    else:
+                        want = plug.get("version") or src_spec
+                        spec = f"{pkg}@{want}"
+                        what = want
+                    ok(f"  {pname}: 安装 {pkg} @ {what}")
+                    # registry 包先离线（本地 store 有同版本就零网络），缺了再联网；
+                    # git 等非 registry 包源码仍要联网，但依赖优先走本地缓存。
+                    res = plugin_add_smart(cfg, lane, pname, spec,
+                                           label="cfg-restore", timeout=timeout,
+                                           non_registry=is_nonreg)
+                    mode = res.get("mode")
                 if res.get("ok"):
-                    report["installed"].append(f"{pname}/{pkg}@{want}")
-                    info(f"    ✓ {pkg}")
+                    report["installed"].append(f"{pname}/{pkg}")
+                    tag = {"offline": "离线复用本地缓存", "online": "联网下载",
+                           "local": "本地插件还原"}.get(mode, "")
+                    info(f"    ✓ {pkg}" + (f"（{tag}）" if tag else ""))
                 else:
                     tail = "\n".join(res.get("tail") or [])[-400:]
                     why = res.get("error") or tail or f"rc={res.get('rc')}"

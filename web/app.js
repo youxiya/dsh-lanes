@@ -1019,10 +1019,20 @@ function openDialog(opts) {
   return ctl;
 }
 
-/** 任务结束时（SSE job_done）挨个问一遍开着的窗口："是不是你的任务？" */
+/** 任务结束时（SSE job_done）挨个问一遍开着的窗口："是不是你的任务？"
+ *  若没有任何窗口认领（任务是在对话框关闭后于后台跑的，比如备份/恢复），
+ *  就在主页面弹一个全局结果提示。 */
 function notifyJobDone(data) {
+  let handled = false;
   for (const ctl of [...openDialogs]) {
-    if (ctl.jobDone) ctl.jobDone(data);
+    if (ctl.jobDone) {
+      ctl.jobDone(data);
+      handled = true;
+    }
+  }
+  if (!handled) {
+    toast(`${data.title}${data.ok ? ' 已完成' : ' 失败'}`, data.ok ? 'ok' : 'err', 4600);
+    if (!data.ok) pushLocal(`[XX] ${data.title}失败，详情看右侧实时日志`, 'err');
   }
 }
 
@@ -2087,7 +2097,8 @@ function renderCfgList(ctl) {
     );
     ctl.setFoot([
       { text: '关闭', act: (c) => c.close() },
-      { text: '新建备份', kind: 'primary', act: (c) => renderCfgCreate(c, st) },
+      { text: '新建备份', kind: 'primary',
+        act: (c) => renderCfgCreate(c, { initialLane: '', createLane: '' }) },
       {
         text: '查看内容 / 增删插件',
         enabled: () => selected >= 0 && items[selected] && items[selected].ok,
@@ -2210,7 +2221,7 @@ function renderCfgCreate(ctl, st) {
         settings: opts.settings.get(),
         credentials: opts.credentials.get(),
         pluginData: [...dataPicked],
-      }, { reload: (self) => renderCfgList(self) }),
+      }),
     },
   ]);
 }
@@ -2432,7 +2443,7 @@ function renderCfgRestore(ctl, name) {
             settings: optSettings.get(),
             credentials: optCred.get(),
             pluginData: optData.get(),
-          }, { reload: (self) => renderCfgList(self) });
+          });
         },
       },
     ]);
